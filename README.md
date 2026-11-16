@@ -8,8 +8,10 @@ It sends old conversation history to the model as images instead of text, keeps 
 Needs Node 20.19 or newer and git.
 
 ```
-npm i -g github:Tan28092006/pxlite
+npm i -g https://github.com/Tan28092006/pxlite/archive/refs/heads/main.tar.gz
 ```
+
+(Not `npm i -g github:Tan28092006/pxlite`: npm 11 links a global git install to a temporary clone it then deletes.)
 
 That installs `pxlite`, `pxclaude` and `pxpipe`, fetches `pxpipe-proxy@0.16.0` from npm and lays pxlite's seven changed files over it (checked by sha256; it refuses to overwrite anything else).
 
@@ -28,7 +30,7 @@ Every `setup` step keeps a `.bak-pxlite-<date>` copy and has `--undo`.
 Run `pxclaude` or `pxlite serve` once before `setup` so the proxy creates its CA file (`~/.pxpipe/warp-ca-bundle.pem`).
 The CA is local and only used for the hosts pxlite diverts (Anthropic and OpenAI); every other host is tunnelled untouched.
 
-Update: `npm i -g github:Tan28092006/pxlite` again.
+Update: run the same install command again.
 Remove: `pxlite setup <target> --undo` for each target you used, `pxlite stop`, then `npm rm -g pxlite`.
 
 ## Use
