@@ -1,0 +1,41 @@
+{
+  "upstream": "pxpipe-proxy",
+  "upstreamVersion": "0.16.0",
+  "files": [
+    {
+      "path": "dist/core/atlas-gray-jbmono14.js",
+      "upstreamSha256": "904e5bc2bfb2b33bd1bb5f8cf5c9e4bc74c378cced34d472ce414f4c933e772e",
+      "overlaySha256": "157d07dfc45d33adccade6106a88a9da0567c56d94f6c1ec8d3cf1e166ef7188"
+    },
+    {
+      "path": "dist/core/atlas-gray.js",
+      "upstreamSha256": "e486c84eed6d28414aba12a55015fb2d1b8e66a442415e4dcca4d307a1180590",
+      "overlaySha256": "e1797a52a2fac3c119f167e9a21d7f15c2416b00d16e6234ad34afda0d70d4f3"
+    },
+    {
+      "path": "dist/core/atlas-jbmono14.js",
+      "upstreamSha256": "b4a73444976da030f6ee1e38c5758eab292f8ca824f36ac149882b78c2fd4184",
+      "overlaySha256": "d57652439e6d6a941fd28d2b608291cfe653f000fd06ec61d7adda80b6fe7ba2"
+    },
+    {
+      "path": "dist/core/atlas.js",
+      "upstreamSha256": "c6a021fff698783ec3a01bc15c294950b410989e9d43d63232c18a906c099d22",
+      "overlaySha256": "f204c5b28e78cfbc80226534c933e914a7e4f165093b1d8065eeb3ef2e460cc3"
+    },
+    {
+      "path": "dist/core/history.js",
+      "upstreamSha256": "248efa7743ebdb8754bc00adf6d1122194ecd7a35aed0c6f5695ae1318884811",
+      "overlaySha256": "932bbae3fba6fb0a8229116560dbcd5bdad7117c1e83d2c1f4281b0ff51f57d8"
+    },
+    {
+      "path": "dist/core/tracker.js",
+      "upstreamSha256": "abd7c4176b2f5ff752a6921a84ce2ef137be900f86b234fb2013884bad801e5d",
+      "overlaySha256": "cd23b152ab6ab875206e66372a47a11c2ed2d22885c691546189a87db82b845d"
+    },
+    {
+      "path": "dist/core/transform.js",
+      "upstreamSha256": "545fbcfc4ed6ebc5ff19d3cd503432967666127a474828496c1b2447f83dc8df",
+      "overlaySha256": "87de7f389c7d8f24f8d5393b6c59451aa5cd834e4e5409f010af7e10391c07bd"
+    }
+  ]
+}

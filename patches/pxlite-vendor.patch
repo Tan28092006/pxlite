@@ -1,0 +1,183 @@
+--- a/dist/core/transform.js
++++ b/dist/core/transform.js
+@@ -887,7 +887,9 @@
+     const first = (messages ?? [])[0];
+     if (!first)
+         return false;
+-    const has = (s) => typeof s === 'string' && s.includes('<system-reminder>');
++    // PXLITE PATCH (patches/pxlite-vendor.patch): a Claude Code compaction summary in the
++    // first message is protected too, so it and the recall images attached to it stay whole.
++    const has = (s) => typeof s === 'string' && (s.includes('<system-reminder>') || s.includes('This session is being continued from a previous conversation'));
+     if (has(first.content))
+         return true;
+     if (Array.isArray(first.content)) {
+@@ -1332,6 +1334,39 @@
+ export function imageByteHeadroom(info, limit) {
+     return Math.max(0, limit - info.imageBytes - (info.nativeImageBytes ?? 0));
+ }
++/**
++ * PXLITE PATCH (2026-11-16, patches/history-byte-trim.patch): collapse that fits the
++ * byte budget instead of being skipped whole.
++ *
++ * Upstream admits the history collapse all-or-nothing: if the rendered pages exceed the
++ * byte headroom, the whole history goes out as text. Measured on this host, 39 of 2062
++ * Claude requests (1.9%) took that path with the JetBrains Mono profile (about 423 KB per
++ * page) and carried 18% of all cache-write tokens, up to 650k characters of raw history.
++ * Here an over-budget collapse is retried with a smaller image budget scaled by the
++ * overshoot, oldest pages first (collapseHistory keeps the oldest, so the frozen chunk
++ * bytes stay stable). If nothing fits after three tries the caller's skip path still runs.
++ */
++async function collapseHistoryFitBytes(messages, profitable, collapseOpts, info, o) {
++    let r = await collapseHistory(messages, profitable, collapseOpts);
++    let budget = collapseOpts.imageBudget;
++    for (let attempt = 0; attempt < 5; attempt++) {
++        const h = r.info;
++        const room = imageByteHeadroom(info, o.maxImageBytes);
++        if (!(h.collapsedTurns > 0) || !(h.collapsedImages > 0) || h.collapsedImageBytes <= room)
++            break;
++        // imageBudget is a ceiling on history pages, not an exact count: the renderer
++        // also images over-long user prompts outside it, so a request for N pages can
++        // come back with more. Shrink the REQUESTED budget, never the achieved count.
++        budget = Math.floor(Math.min(budget, h.collapsedImages) * (room / h.collapsedImageBytes) * 0.9);
++        if (budget < 1)
++            break;
++        if (process.env.PXLITE_DEBUG_TRIM)
++            console.error('[trim]', attempt, 'imgs', h.collapsedImages, 'bytes', h.collapsedImageBytes, 'room', room, 'next', budget, 'turns', h.collapsedTurns);
++        info.historyByteTrims = (info.historyByteTrims ?? 0) + 1;
++        r = await collapseHistory(messages, profitable, { ...collapseOpts, imageBudget: budget });
++    }
++    return r;
++}
+ /** True when this request finished close enough to the budget that the next turn
+  *  of the same session is likely to hit it. */
+ function nearByteLimit(info, limit) {
+@@ -1674,7 +1709,7 @@
+         // non-collapse path already keeps <system-reminder> as text below.
+         const protectedPrefix = firstMessageHasSystemReminder(req.messages) ? 1 : 0;
+         const tuning = historyGridTuning(info);
+-        const { messages: newMessages, info: histInfo } = await collapseHistory(req.messages, historyProfitable, {
++        const { messages: newMessages, info: histInfo } = await collapseHistoryFitBytes(req.messages, historyProfitable, {
+             cols: historyGeometry.cols,
+             protectedPrefix,
+             reflow: o.reflow,
+@@ -1684,7 +1719,7 @@
+             imageBudget: tuning.imageBudget,
+             packFill: tuning.packFill,
+             minFreezeStep: tuning.minFreezeStep,
+-        });
++        }, info, o);
+         recordFreezeStep(info.firstUserSha8, histInfo.freezeStep);
+         if (histInfo.freezeStep !== undefined)
+             info.historyFreezeStep = histInfo.freezeStep;
+@@ -2243,7 +2278,7 @@
+         };
+         const slabAnchorIdx = (req.messages ?? []).findIndex((m) => m.role === 'user');
+         const tuning = historyGridTuning(info);
+-        const { messages: newMessages, info: histInfo } = await collapseHistory(req.messages, historyProfitable, {
++        const { messages: newMessages, info: histInfo } = await collapseHistoryFitBytes(req.messages, historyProfitable, {
+             cols: historyGeometry.cols,
+             protectedPrefix: slabAnchorIdx >= 0 ? slabAnchorIdx + 1 : 0,
+             reflow: o.reflow,
+@@ -2253,7 +2288,7 @@
+             imageBudget: tuning.imageBudget,
+             packFill: tuning.packFill,
+             minFreezeStep: tuning.minFreezeStep,
+-        });
++        }, info, o);
+         recordFreezeStep(info.firstUserSha8, histInfo.freezeStep);
+         if (histInfo.freezeStep !== undefined)
+             info.historyFreezeStep = histInfo.freezeStep;
+--- a/dist/core/tracker.js
++++ b/dist/core/tracker.js
+@@ -58,6 +58,12 @@
+         // should not pay a key per event.
+         if ((info.nativeImages ?? 0) > 0)
+             out.native_images = info.nativeImages;
++        // PXLITE PATCH: native image bytes and byte-trim retries, to tell apart the causes
++        // of an image_bytes skip (client images vs. our own pages) in later audits.
++        if ((info.nativeImageBytes ?? 0) > 0)
++            out.native_image_bytes = info.nativeImageBytes;
++        if ((info.historyByteTrims ?? 0) > 0)
++            out.history_byte_trims = info.historyByteTrims;
+         if ((info.imageBudgetSkips ?? 0) > 0)
+             out.image_budget_skips = info.imageBudgetSkips;
+         // Emit only when it disagrees with the render counter: equality is the common
+--- a/dist/core/history.js
++++ b/dist/core/history.js
+@@ -139,7 +139,12 @@
+  * most-recent assistant turn needs bit-perfect thinking, and it's in the live tail).
+  * Inline images collapse to [image] to avoid double-encoding.
+  */
+-export function blocksToText(content) {
++/** PXLITE PATCH (patches/history-drop-tools.patch): in collapsed history, drop tool calls
++ *  and tool results, keep one "[Edit] path" line per file edit and every assistant message
++ *  that carries no tool call (the answers). Off with PXLITE_HISTORY_KEEP_TOOLS=1. */
++const HISTORY_DROP_TOOLS = !/^(1|true|yes|on)$/i.test(process.env.PXLITE_HISTORY_KEEP_TOOLS ?? '');
++const HISTORY_EDIT_TOOLS = new Set(['Edit', 'Write', 'NotebookEdit', 'MultiEdit']);
++export function blocksToText(content, opts) {
+     if (typeof content === 'string')
+         return content;
+     // Untrusted bodies can carry a non-array content (e.g. `content: null`).
+@@ -148,16 +153,28 @@
+     if (!Array.isArray(content))
+         return '';
+     const parts = [];
++    const dropTools = opts?.dropTools === true;
++    // A lead-in sentence ("I will check ...") that rides with a tool call is noise later;
++    // the message that carries the answer has no tool call and keeps its text.
++    const leadIn = dropTools && content.some((b) => b && typeof b === 'object' && b.type === 'tool_use');
+     for (const blk of content) {
+         if (!blk || typeof blk !== 'object')
+             continue;
+         const t = blk.type;
+         switch (t) {
+             case 'text':
++                if (leadIn)
++                    break;
+                 parts.push(blk.text);
+                 break;
+             case 'tool_use': {
+                 const tu = blk;
++                if (dropTools) {
++                    const file = tu.input?.file_path ?? tu.input?.notebook_path;
++                    if (HISTORY_EDIT_TOOLS.has(tu.name) && typeof file === 'string')
++                        parts.push(`[${tu.name}] ${file}`);
++                    break;
++                }
+                 // Compact JSON (no indent) — pretty-printing bloats text ~5× and the renderer is row-aware.
+                 let argsStr;
+                 try {
+@@ -170,6 +187,8 @@
+                 break;
+             }
+             case 'tool_result': {
++                if (dropTools)
++                    break;
+                 const tr = blk;
+                 const inner = tr.content;
+                 let innerText;
+@@ -242,7 +261,7 @@
+         // The user's typed words are carried as TEXT alongside the image (see
+         // userTurnBlocks) and are deliberately not rasterized. Everything else in the
+         // message — tool_results, system-reminders, slab scaffolding — still renders.
+-        const body = blocksToText(m.role === 'user' ? withoutTypedUserText(m.content) : m.content);
++        const body = blocksToText(m.role === 'user' ? withoutTypedUserText(m.content) : m.content, { dropTools: HISTORY_DROP_TOOLS });
+         if (!body.trim())
+             continue;
+         const isAssistant = m.role === 'assistant';
+@@ -399,6 +418,15 @@
+         };
+         // Standing instructions survive verbatim; only the stale request prose demotes.
+         const demoteText = (text, cc) => {
++            // PXLITE PATCH (patches/history-keep-summary.patch): a Claude Code compaction
++            // summary is the session's memory, not stale request prose. The tombstone cut it
++            // to head+tail (2600+1400 chars) and lost the middle; keep it whole.
++            if (typeof text === 'string' && text.includes('This session is being continued from a previous conversation')) {
++                const whole = { type: 'text', text };
++                if (cc !== undefined)
++                    whole.cache_control = cc;
++                return [whole];
++            }
+             const { reminders, rest } = splitStandingInstructions(text);
+             // A protected opening turn above the normal native-text budget is exactly
+             // where a long task contract lives. Keep its existing bounded head+tail

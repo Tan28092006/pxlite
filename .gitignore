@@ -1,0 +1,5 @@
+node_modules/
+vendor/
+build/atlas/out/
+build/atlas/node_modules/
+*.log

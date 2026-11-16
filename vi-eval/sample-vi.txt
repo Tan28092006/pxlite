@@ -1,0 +1,8 @@
+Phiên này chưa đi qua proxy được: extension VS Code chỉ đọc biến môi trường lúc mở phiên, và phiên này mở trước khi mình cài.
+Muốn nén thật thì phải reload VS Code, nghĩa là sang một phiên mới.
+Kết quả: history 386 nghìn ký tự, trong đó 213 lượt cũ bị gộp thành 26 ảnh, chỉ còn khoảng 50 nghìn ký tự ở dạng text.
+Có một vấn đề với tiếng Việt: font chữ nhỏ mà pxpipe dùng cho Claude không có chữ có dấu, nên các chữ đó bị thay bằng mã.
+Model vẫn có thể giải mã được, nhưng tốn chỗ và khó đọc hơn, nên phần chat tiếng Việt cũ có thể bị nhớ kém chính xác.
+Người nghiên cứu quyết định giữ lưới đủ hay cắt bớt sau khi đọc thời gian thật của lượt n=20 trong file nhật ký.
+Bộ lọc giữ số liệu ở dạng text vẫn hoạt động; tệp kết quả JSON, bảng và log được giữ nguyên chữ.
+Đường cơ sở cổ điển phải công bằng: cùng ngân sách, cùng cách chia dữ liệu, cùng số lần lặp và cùng hạt giống ngẫu nhiên.

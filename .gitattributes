@@ -1,0 +1,9 @@
+* text=auto eol=lf
+# The overlay files are verified by sha256 at install time: never touch their line endings.
+overlay/** -text
+patches/** -text
+templates/** -text
+*.png binary
+*.otf binary
+*.otb binary
+*.ttf binary

@@ -1,0 +1,9 @@
+node_modules/
+vendor/
+build/
+compact-eval/
+recall-eval/
+vi-eval/
+patches/orig/
+scripts/make-overlay-manifest.mjs
+*.log

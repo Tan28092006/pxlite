@@ -1,0 +1,20 @@
+{
+  "name": "pxlite",
+  "version": "1.0.0",
+  "description": "Slim launcher around pxpipe-proxy 0.16.0 for long Claude Code, OpenCode and Codex sessions: images prose and code history, Vietnamese glyph atlases, recall of earlier sessions.",
+  "type": "module",
+  "license": "MIT",
+  "engines": { "node": ">=20.19" },
+  "bin": {
+    "pxlite": "pxlite.mjs",
+    "pxclaude": "pxclaude.mjs",
+    "pxpipe": "pxpipe.mjs"
+  },
+  "dependencies": {
+    "pxpipe-proxy": "0.16.0"
+  },
+  "scripts": {
+    "postinstall": "node scripts/postinstall.mjs",
+    "test": "node --test test.mjs"
+  }
+}

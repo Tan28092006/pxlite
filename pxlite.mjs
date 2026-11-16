@@ -1,0 +1,464 @@
+#!/usr/bin/env node
+// pxlite: a slim pxpipe proxy for long Claude Code sessions.
+//   - images prose and code only: data-like tool_results stay text (classify.mjs)
+//   - events.jsonl is size-capped and aged out (rotlog.mjs)
+//   - no dashboard (no in-memory event replay), smaller render cache
+// Built on pxpipe-proxy's core createProxy; the HTTP glue mirrors dist/node.js.
+//
+// Usage: node pxlite.mjs [serve|stop|status|classify <file>]
+import fs from 'node:fs';
+import http from 'node:http';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { analyze } from './classify.mjs';
+import { RotatingLog } from './rotlog.mjs';
+import { classifyCompaction, decodeRequestBody, stripCacheBreakpoints } from './compat.mjs';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { createRecall, describeResponsesShape } from './recall.mjs';
+import { createClaudeRecall } from './recall-claude.mjs';
+import { createSessionRecall, listSessions, sessionInfo } from './recall-session.mjs';
+
+// Set by serve() when recall is enabled; used by toWebRequest on request bodies.
+let recall = null; // OpenCode, Responses
+let claudeRecall = null; // Claude Code, Messages
+
+// Per-request flags read by proxyConfig.transform(), which pxpipe calls with no
+// arguments inside the request's async context.
+const requestCtx = new AsyncLocalStorage();
+// A compaction summary is what the next session lives on; one test (2026-11-15) showed
+// a summary read from history images keep a superseded Codex setup as the final one.
+// So compaction requests go upstream as plain text unless PXLITE_COMPACT_IMAGES=1.
+const COMPACT_IMAGES = /^(1|true|yes|on)$/i.test(process.env.PXLITE_COMPACT_IMAGES ?? '');
+
+const TESTED_PXPIPE = '0.16.0';
+const HOME = os.homedir();
+const STATE_DIR = path.join(HOME, '.pxpipe');
+const PORT = Number(process.env.PORT ?? 47821);
+const PID_FILE = path.join(STATE_DIR, `pxlite-${PORT}.pid`);
+const HOST = '127.0.0.1';
+const CONNECT_PORT = Number(process.env.PXLITE_CONNECT_PORT ?? PORT + 1);
+// Vendored pxpipe 0.16.0 whose glyph atlases add Vietnamese (build/atlas, vi-eval/RESULTS.md).
+const PKG = process.env.PXLITE_PKG ?? path.join(path.dirname(fileURLToPath(import.meta.url)), 'vendor', 'pxpipe-proxy');
+const VERBOSE = /^(1|true|yes|on)$/i.test(process.env.PXLITE_VERBOSE ?? '');
+
+const cmd = process.argv[2] ?? 'serve';
+if (cmd === 'classify') classifyCmd(process.argv.slice(3));
+else if (cmd === 'stop') stopCmd();
+else if (cmd === 'status') await statusCmd();
+else if (cmd === 'serve') { await ensureVendor(); await serve(); }
+else if (cmd === 'sessions') sessionsCmd(process.argv.slice(3));
+else if (cmd === 'setup') await (await import('./setup.mjs')).setupCmd(process.argv.slice(3), { pxliteMjs: fileURLToPath(import.meta.url), port: PORT, connectPort: CONNECT_PORT, stateDir: STATE_DIR });
+else {
+  console.error('usage: pxlite [serve|stop|status|classify <file>...|sessions [--all] [words]|setup [claude-vscode|codex|opencode|autostart] [--undo] [--yes]]');
+  process.exit(64);
+}
+
+// vendor/ is built by npm's postinstall; build it on first run when that step was skipped
+// (npm config ignore-scripts, or a copy of the repo that was never installed).
+async function ensureVendor() {
+  if (process.env.PXLITE_PKG || fs.existsSync(path.join(PKG, 'package.json'))) return;
+  console.log('[pxlite] building vendor/pxpipe-proxy (first run)');
+  await import('./scripts/postinstall.mjs');
+}
+
+// Earlier Claude Code sessions of the current folder (or of every project with --all), newest
+// first: the names that "recall <words>" matches, and the ids it accepts.
+function sessionsCmd(args) {
+  const all = args.includes('--all');
+  const words = args.filter((a) => a !== '--all').join(' ').toLowerCase().split(/\s+/).filter(Boolean);
+  const projects = path.join(HOME, '.claude', 'projects');
+  const dirs = all ? fs.readdirSync(projects).map((n) => path.join(projects, n)) : [path.join(projects, process.cwd().replace(/[^A-Za-z0-9]/g, '-'))];
+  const rows = dirs.flatMap((d) => listSessions(d).filter((s) => s.size >= 6000).slice(0, all ? 40 : 200).map((s) => ({ ...s, ...sessionInfo(s.file, s.size), project: path.basename(d) })));
+  const shown = rows
+    .filter((r) => words.every((w) => `${r.title}\n${r.first}`.toLowerCase().includes(w)))
+    .sort((a, b) => b.mtimeMs - a.mtimeMs)
+    .slice(0, 20);
+  if (!shown.length) console.log(all ? 'no sessions found' : `no sessions found for ${process.cwd()} (try --all)`);
+  for (const r of shown) {
+    const when = new Date(r.mtimeMs).toISOString().slice(0, 16).replace('T', ' ');
+    console.log(`${r.id.slice(0, 8)}  ${when}  ${String(Math.round(r.size / 1024)).padStart(6)} KB  ${r.title || r.first.slice(0, 60).replace(/\s+/g, ' ')}${all ? `  [${r.project}]` : ''}`);
+  }
+}
+
+function classifyCmd(files) {
+  for (const f of files) {
+    const text = fs.readFileSync(f, 'utf8');
+    const asRead = text.split('\n').map((l, i) => String(i + 1).padStart(6) + '\t' + l).join('\n');
+    const { reason } = analyze(asRead);
+    const verdict = reason ? `text (${reason})` : asRead.length < 6000 ? 'text (below 6000 chars)' : 'image allowed';
+    console.log(`${verdict.padEnd(26)} ${f}`);
+  }
+}
+
+function readPid() {
+  try {
+    return Number(fs.readFileSync(PID_FILE, 'utf8').trim()) || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function stopCmd() {
+  const pid = readPid();
+  if (!pid) return console.log('pxlite: not running (no pid file)');
+  try {
+    process.kill(pid);
+    console.log(`pxlite: stopped pid ${pid}`);
+  } catch (err) {
+    console.log(`pxlite: pid ${pid} not running (${err.code})`);
+  }
+  fs.rmSync(PID_FILE, { force: true });
+}
+
+async function statusCmd() {
+  try {
+    const res = await fetch(`http://${HOST}:${PORT}/pxlite/status`);
+    console.log(JSON.stringify(await res.json(), null, 2));
+  } catch {
+    console.log(`pxlite: not listening on ${HOST}:${PORT}`);
+    process.exitCode = 1;
+  }
+}
+
+// ~/.config/pxpipe/config.json: {"models": [...], "gptProfiles": {prefix: partial profile}}.
+// Environment variables win over the file.
+function applyConfigFileModels() {
+  const file = process.env.PXPIPE_CONFIG ?? path.join(HOME, '.config', 'pxpipe', 'config.json');
+  let cfg;
+  try {
+    cfg = JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch {
+    return; // no config file: keep pxpipe's built-in defaults
+  }
+  const models = cfg.models;
+  if (process.env.PXPIPE_MODELS === undefined) {
+    if (Array.isArray(models)) process.env.PXPIPE_MODELS = models.join(',') || 'off';
+    else if (typeof models === 'string') process.env.PXPIPE_MODELS = models.trim() || 'off';
+  }
+  if (process.env.PXPIPE_GPT_PROFILES === undefined && cfg.gptProfiles && typeof cfg.gptProfiles === 'object') {
+    process.env.PXPIPE_GPT_PROFILES = JSON.stringify(cfg.gptProfiles);
+  }
+}
+
+function fileStore(file) {
+  return {
+    load: () => (fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : undefined),
+    save(text) {
+      const tmp = `${file}.${process.pid}.tmp`;
+      fs.writeFileSync(tmp, text, { mode: 0o600 });
+      fs.renameSync(tmp, file);
+    },
+  };
+}
+
+// PXLITE_DEBUG_SHAPE=1 appends content-free shapes of Responses requests (incoming
+// from the client, outgoing after pxpipe) to ~/.pxpipe/shape-debug.jsonl.
+const DEBUG_SHAPE = /^(1|true|yes|on)$/i.test(process.env.PXLITE_DEBUG_SHAPE ?? '');
+function debugShape(dir, url, body, headers) {
+  try {
+    const text = typeof body === 'string' ? body : new TextDecoder().decode(body);
+    const rec = { ts: new Date().toISOString(), dir, url: String(url).replace(/^https?:\/\/[^/]+/, ''), ...describeResponsesShape(JSON.parse(text), headers) };
+    fs.appendFileSync(path.join(os.homedir(), '.pxpipe', 'shape-debug.jsonl'), JSON.stringify(rec) + '\n');
+  } catch (err) {
+    console.warn(`[pxlite] shape debug failed: ${err.message}`);
+  }
+}
+
+// Codex's built-in ChatGPT provider zstd-compresses request bodies; pxpipe must see
+// plain JSON to transform them, so buffer and decode those before handing over.
+async function toWebRequest(req) {
+  const headers = new Headers();
+  for (const [k, v] of Object.entries(req.headers)) {
+    if (v == null) continue;
+    if (Array.isArray(v)) v.forEach((vv) => headers.append(k, vv));
+    else headers.append(k, v);
+  }
+  const method = req.method ?? 'GET';
+  const hasBody = method !== 'GET' && method !== 'HEAD';
+  const url = `http://${req.headers.host ?? 'localhost'}${req.url ?? '/'}`;
+  const anthropicMessages = method === 'POST' && /^\/v1\/messages(\?|$)/.test(req.url ?? '');
+  const responses = method === 'POST' && /^\/(backend-api\/codex|v1)\/responses(\?|$)/.test(req.url ?? '');
+  if (hasBody && (headers.has('content-encoding') || anthropicMessages || (responses && (DEBUG_SHAPE || recall)))) {
+    const chunks = [];
+    for await (const c of req) chunks.push(c);
+    const raw = Buffer.concat(chunks);
+    const plain = headers.has('content-encoding') ? decodeRequestBody(headers.get('content-encoding'), raw) : null;
+    if (plain) {
+      headers.delete('content-encoding');
+      headers.set('content-length', String(plain.byteLength));
+    }
+    let bytes = plain ?? raw;
+    const c = anthropicMessages ? classifyCompaction(bytes) : { compact: false, where: null };
+    // Recall: OpenCode Responses (recall.mjs) and Claude Code Messages after a
+    // compaction (recall-claude.mjs); never on the compaction request itself.
+    const r = responses ? recall : anthropicMessages && !c.compact ? claudeRecall : null;
+    if (anthropicMessages && process.env.PXLITE_DEBUG_META) {
+      try {
+        const b = JSON.parse(bytes.toString('utf8'));
+        const sysText = JSON.stringify(b.system ?? '');
+        console.error('[pxlite] meta', JSON.stringify({ keys: Object.keys(b), metadata: b.metadata, cwd: sysText.match(/Primary working directory: [^\\"]{0,120}/)?.[0], hdrKeys: [...headers.keys()].filter((k) => /session|claude|anthropic-/i.test(k)) }));
+      } catch {}
+    }
+    if (r) {
+      try {
+        const next = await r.apply(JSON.parse(bytes.toString('utf8')), headers);
+        if (next) {
+          bytes = Buffer.from(JSON.stringify(next));
+          headers.set('content-length', String(bytes.byteLength));
+        }
+      } catch (err) {
+        // Recall must never break a request: forward the original body.
+        console.warn(`[pxlite] recall skipped: ${err.message}`);
+      }
+    }
+    const request = new Request(url, { method, headers, body: bytes });
+    request.pxliteCompact = c.compact;
+    request.pxliteCompactWhere = c.where;
+    if (responses && DEBUG_SHAPE) debugShape('in', req.url, plain ?? raw, headers);
+    return request;
+  }
+  const body = hasBody
+    ? new ReadableStream({
+        start(c) {
+          req.on('data', (chunk) => c.enqueue(chunk));
+          req.on('end', () => c.close());
+          req.on('error', (e) => c.error(e));
+        },
+      })
+    : undefined;
+  return new Request(url, {
+    method,
+    headers,
+    body,
+    duplex: hasBody ? 'half' : undefined,
+  });
+}
+
+async function writeWebResponse(res, out) {
+  out.statusCode = res.status;
+  res.headers.forEach((v, k) => out.setHeader(k, v));
+  if (!res.body) return void out.end();
+  out.flushHeaders();
+  const reader = res.body.getReader();
+  const cancel = () => void reader.cancel().catch(() => {});
+  out.once('close', cancel);
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (value && !out.write(value)) await new Promise((ok, fail) => {
+        out.once('drain', ok);
+        out.once('close', () => fail(new Error('client response closed')));
+      });
+    }
+    if (!out.writableEnded) out.end();
+  } catch (err) {
+    if (!out.destroyed) out.destroy(err instanceof Error ? err : undefined);
+  } finally {
+    out.off('close', cancel);
+  }
+}
+
+function slimEvent(ev) {
+  for (const k of Object.keys(ev)) if (k.startsWith('req_body_') && k !== 'req_body_sha8') delete ev[k];
+  if (typeof ev.error_body === 'string' && ev.error_body.length > 400) ev.error_body = ev.error_body.slice(0, 400) + '…';
+  return ev;
+}
+
+async function serve() {
+  // Must be set before pxpipe's render module loads: it reads the cap once at import.
+  process.env.PXPIPE_RENDER_CACHE_BYTES ??= String(16 * 1024 * 1024);
+  applyConfigFileModels();
+  const core = (p) => import(pathToFileURL(path.join(PKG, 'dist', p.includes('/') ? '' : 'core', p)).href);
+  const version = JSON.parse(fs.readFileSync(path.join(PKG, 'package.json'), 'utf8')).version;
+  if (version !== TESTED_PXPIPE) console.warn(`[pxlite] pxpipe-proxy ${version} found, tested with ${TESTED_PXPIPE}; core API may differ`);
+  const [{ createProxy }, { toTrackEvent }, sessions] = await Promise.all([core('proxy.js'), core('tracker.js'), core('session-state.js')]);
+
+  fs.mkdirSync(STATE_DIR, { recursive: true });
+  sessions.configureSessionStateStore(fileStore(path.join(STATE_DIR, 'session-state.json')));
+  const log = new RotatingLog(process.env.PXPIPE_LOG ?? path.join(STATE_DIR, 'events.jsonl'), {
+    // 50 MB live + one 50 MB backup = at most 100 MB on disk.
+    maxBytes: Number(process.env.PXLITE_LOG_MAX_BYTES ?? 50 * 1024 * 1024),
+    maxAgeDays: Number(process.env.PXLITE_LOG_MAX_DAYS ?? 14),
+  });
+  const disabled = /^(1|true|yes|on)$/i.test(process.env.PXPIPE_DISABLE ?? '');
+  const stats = { started: new Date().toISOString(), requests: 0, compressed: 0, keptText: {}, imageBytes: 0 };
+
+  // Recall after OpenAI server-side compaction (recall.mjs). Off with PXLITE_RECALL=0.
+  if (!disabled && !/^(0|false|no|off)$/i.test(process.env.PXLITE_RECALL ?? '')) {
+    const [{ renderTextToImages }, { openAIImageDetail }, { responsesItemsToTurns }] = await Promise.all([core('library.js'), core('openai.js'), core('openai-history.js')]);
+    const prefixes = (process.env.PXLITE_RECALL_MODELS ?? 'gpt-6.1-sol,gpt-6.1-terra').split(',').map((s) => s.trim()).filter(Boolean);
+    const r = createRecall({
+      dir: path.join(STATE_DIR, 'recall'),
+      toTurns: responsesItemsToTurns,
+      render: async (text, model) => (await renderTextToImages(text, { model, reflow: true })).pages,
+      imageDetail: openAIImageDetail,
+      maxChars: Number(process.env.PXLITE_RECALL_MAX_CHARS ?? 200_000),
+      maxImages: Number(process.env.PXLITE_RECALL_MAX_IMAGES ?? 24),
+    });
+    stats.recall = r.stats;
+    const cr = createClaudeRecall({
+      render: async (text, model) => (await renderTextToImages(text, { model, reflow: true })).pages,
+      maxChars: Number(process.env.PXLITE_RECALL_MAX_CHARS ?? 200_000),
+      maxImages: Number(process.env.PXLITE_RECALL_CLAUDE_MAX_IMAGES ?? 12),
+    });
+    stats.claudeRecall = cr.stats;
+    // Recall only for models pxpipe itself images (config.json / PXPIPE_MODELS), so a model
+    // outside that scope, such as Haiku, never receives images it was not validated for.
+    const { isPxpipeSupportedModel } = await core('applicability.js');
+    // "recall <name>" typed in a new session (recall-session.mjs) first, else the post-compaction recall.
+    const sr = createSessionRecall({
+      render: async (text, model) => (await renderTextToImages(text, { model, reflow: true })).pages,
+      maxChars: Number(process.env.PXLITE_RECALL_MAX_CHARS ?? 200_000),
+      maxImages: Number(process.env.PXLITE_RECALL_SESSION_MAX_IMAGES ?? 12),
+    });
+    stats.sessionRecall = sr.stats;
+    claudeRecall = { apply: async (body, headers) => (isPxpipeSupportedModel(String(body?.model ?? '')) ? (await sr.apply(body, headers)) ?? cr.apply(body) : null) };
+    recall = {
+      // OpenCode only (user's choice 2026-11-15): Codex marks its requests with an
+      // `originator` header (codex_cli_rs, Codex Desktop …) and has its own compaction.
+      apply: async (body, headers) => {
+        if (/codex/i.test(headers?.get?.('originator') ?? '')) return null;
+        return prefixes.some((p) => String(body?.model ?? '').startsWith(p)) ? r.apply(body, headers) : null;
+      },
+    };
+  }
+
+  const keepSharp = (block) => {
+    const { reason } = analyze(block.text);
+    if (reason) stats.keptText[reason] = (stats.keptText[reason] ?? 0) + 1;
+    return reason !== null;
+  };
+
+  const proxyConfig = {
+    transform: () => {
+      if (disabled) return { compress: false };
+      if (requestCtx.getStore()?.compact && !COMPACT_IMAGES) return { compress: false };
+      return { keepSharp };
+    },
+    onRequest: (e) => {
+      stats.requests += 1;
+      if (e.info?.compressed) {
+        stats.compressed += 1;
+        stats.imageBytes += e.info.imageBytes ?? 0;
+      }
+      try {
+        log.write(slimEvent(toTrackEvent(e)));
+      } catch (err) {
+        console.warn(`[pxlite] event log write failed: ${err.message}`);
+      }
+      if (VERBOSE) {
+        const tag = e.info?.compressed ? `img=${e.info.imageCount}` : (e.info?.reason ?? '');
+        console.log(`[${new Date().toISOString()}] ${e.method} ${e.path} ${e.status} ${e.durationMs}ms ${tag}`);
+      }
+    },
+  };
+  const handle = createProxy(proxyConfig);
+  // Codex and OpenCode with a ChatGPT login call chatgpt.com/backend-api/codex/*;
+  // pxpipe forwards OpenAI-shaped paths to one OpenAI base, so give them their own.
+  const handleChatGPT = createProxy({ ...proxyConfig, openAIUpstream: 'https://chatgpt.com' });
+  // pxpipe's Sol profile marks an explicit `prompt_cache_breakpoint`; both the
+  // ChatGPT Codex backend and api.openai.com reject it for gpt-6.1-sol(-fast) with a
+  // 400. pxpipe calls the global fetch, so strip that key on Responses routes.
+  const nativeFetch = globalThis.fetch;
+  const RESPONSES = /^https:\/\/(chatgpt\.com\/backend-api\/codex|api\.openai\.com\/v1)\/responses/;
+  globalThis.fetch = async (input, init) => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input?.url;
+    if (init?.body && RESPONSES.test(url ?? '')) {
+      init = { ...init, body: stripCacheBreakpoints(init.body) };
+      if (DEBUG_SHAPE) debugShape('out', url, init.body, new Headers(init.headers));
+    }
+    return nativeFetch(input, init);
+  };
+  const pickHandler = (url) => (url?.startsWith('/backend-api/') ? handleChatGPT : handle);
+
+  // Persistent HTTPS_PROXY endpoint (what `pxpipe warp` builds per child): clients
+  // that cannot be wrapped (VS Code extension, desktop apps) point HTTPS_PROXY here
+  // and trust ~/.pxpipe/warp-ca-bundle.pem. Only routed hosts are decrypted; every
+  // other host is tunnelled untouched.
+  const [{ CertificateAuthority }, { createWarpHandlers }, { parseRoute }] = await Promise.all([
+    core('warp/ca.js'),
+    core('warp/connect.js'),
+    core('warp/route.js'),
+  ]);
+  const ca = CertificateAuthority.loadOrCreate(STATE_DIR);
+  const to = `http://${HOST}:${PORT}`;
+  const routes = [
+    'api.anthropic.com/v1/messages*',
+    // responses only: analytics and other backend-api calls must tunnel untouched
+    'chatgpt.com/backend-api/codex/responses*',
+    'api.openai.com/v1/responses*',
+    'daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent*',
+    'daily-cloudcode-pa.googleapis.com/v1internal:generateContent*',
+    'generativelanguage.googleapis.com/v1beta/models/*:streamGenerateContent*',
+    'generativelanguage.googleapis.com/v1beta/models/*:generateContent*',
+  ].map((r) => parseRoute(`${r}=${to}`));
+  const diverted = new Set();
+  const warp = createWarpHandlers({
+    routes,
+    ca,
+    onDivert: (host, p) => {
+      if (diverted.has(host)) return;
+      diverted.add(host);
+      console.log(`[pxlite] connect: diverting ${host}${p}`);
+    },
+  });
+  const connectServer = http.createServer(warp.handleAbsoluteForm);
+  connectServer.on('connect', warp.handleConnect);
+  connectServer.on('error', (err) => console.error(`[pxlite] connect proxy disabled: ${err.message}`));
+  connectServer.listen(CONNECT_PORT, HOST, () => console.log(`[pxlite] HTTPS_PROXY=http://${HOST}:${CONNECT_PORT}  CA=${ca.bundlePath}`));
+
+  const server = http.createServer((req, res) => {
+    Promise.resolve()
+      .then(async () => {
+        if (req.url === '/pxlite/status') {
+          const m = process.memoryUsage();
+          const body = { ...stats, models: process.env.PXPIPE_MODELS ?? '(pxpipe default)', connect_port: CONNECT_PORT, ca_bundle: ca.bundlePath, pkg: PKG, pid: process.pid, pxpipe: version, rss_mb: Math.round(m.rss / 1048576), heap_mb: Math.round(m.heapUsed / 1048576), log: log.file, log_bytes: log.size };
+          res.setHeader('content-type', 'application/json');
+          return void res.end(JSON.stringify(body));
+        }
+        // pxpipe only transforms HTTP POSTs. Refuse WebSocket upgrades locally with
+        // 426 so Codex falls back to HTTP at once instead of retrying upstream.
+        if (/websocket/i.test(req.headers.upgrade ?? '')) {
+          stats.websocketRefused = (stats.websocketRefused ?? 0) + 1;
+          res.statusCode = 426;
+          return void res.end('pxlite: WebSocket not supported, use HTTP');
+        }
+        const webReq = await toWebRequest(req);
+        const compact = Boolean(webReq.pxliteCompact);
+        if (compact) stats.compactText = (stats.compactText ?? 0) + 1;
+        // Marker seen but not treated as compaction: either a session quoting the
+        // phrase in history, or a compaction shape pxlite does not know yet.
+        else if (webReq.pxliteCompactWhere) {
+          stats.compactMarkerElsewhere ??= {};
+          stats.compactMarkerElsewhere[webReq.pxliteCompactWhere] = (stats.compactMarkerElsewhere[webReq.pxliteCompactWhere] ?? 0) + 1;
+        }
+        const handler = pickHandler(req.url);
+        await writeWebResponse(await requestCtx.run({ compact }, () => handler(webReq)), res);
+      })
+      .catch((err) => {
+        console.error('[pxlite] handler error:', err);
+        if (!res.headersSent) res.statusCode = 500;
+        if (!res.writableEnded) res.end();
+      });
+  });
+  server.on('error', (err) => {
+    console.error(err.code === 'EADDRINUSE' ? `[pxlite] port ${PORT} is in use (another pxpipe/pxlite?)` : `[pxlite] ${err.message}`);
+    process.exit(2);
+  });
+  server.listen(PORT, HOST, () => {
+    fs.writeFileSync(PID_FILE, String(process.pid));
+    console.log(`[pxlite] listening on http://${HOST}:${PORT} (pxpipe ${version}${disabled ? ', passthrough' : ''}); log ${log.file}`);
+  });
+
+  const shutdown = () => {
+    sessions.flushSessionState();
+    if (readPid() === process.pid) fs.rmSync(PID_FILE, { force: true });
+    connectServer.close();
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 1500).unref();
+  };
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+}

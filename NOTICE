@@ -1,0 +1,13 @@
+pxlite builds on other people's work.
+
+pxpipe-proxy 0.16.0 (MIT, Copyright (c) 2026 claude-image-proxy contributors)
+  https://github.com/teamchong/pxpipe
+  Fetched from npm at install time. Seven files under dist/core/ are replaced by the versions in overlay/
+  (glyph atlases with Vietnamese letters, byte-budget trim, tool calls dropped from collapsed history,
+  compaction summary kept whole). The upstream licence is in LICENSE.pxpipe-proxy; patches/ has the diff.
+
+Fonts used to regenerate the glyph atlases (build/atlas/assets, each with its licence file):
+  GNU Unifont 16.0.04        UNIFONT_LICENSE.txt
+  Spleen 5x8                 SPLEEN_LICENSE.txt
+  JetBrains Mono Regular     JETBRAINS_MONO_LICENSE.txt
+The generated atlases in overlay/ contain glyph bitmaps derived from these fonts and fall under their terms.
