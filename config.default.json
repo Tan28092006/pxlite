@@ -1,0 +1,11 @@
+{
+  "models": ["claude-fable-5", "claude-opus-5-5", "claude-sonnet-5-5", "gemini", "gpt-6.1-sol", "gpt-6.1-terra"],
+  "gptProfiles": {
+    "gpt-6.1-terra": {
+      "stripCols": 84,
+      "maxHeightPx": 1954,
+      "factSheetFormat": "full",
+      "style": { "font": "jetbrains-mono-14", "cellWBonus": 0, "cellHBonus": 0, "aa": true, "grid": false, "gridCols": 0, "colorCycle": false, "markerScale": 1, "markerRed": false, "inkDilate": 0 }
+    }
+  }
+}

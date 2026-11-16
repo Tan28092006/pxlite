@@ -125,12 +125,19 @@ async function statusCmd() {
 // Environment variables win over the file.
 function applyConfigFileModels() {
   const file = process.env.PXPIPE_CONFIG ?? path.join(HOME, '.config', 'pxpipe', 'config.json');
+  // Without a user file, use the config.default.json that ships with pxlite (models imaged and the
+  // tuned gpt-6.1-terra profile), so a fresh install images the same models as the author's setup.
+  const shipped = path.join(path.dirname(fileURLToPath(import.meta.url)), 'config.default.json');
   let cfg;
-  try {
-    cfg = JSON.parse(fs.readFileSync(file, 'utf8'));
-  } catch {
-    return; // no config file: keep pxpipe's built-in defaults
+  for (const f of [file, shipped]) {
+    try {
+      cfg = JSON.parse(fs.readFileSync(f, 'utf8'));
+      break;
+    } catch {
+      // try the next one
+    }
   }
+  if (!cfg) return; // keep pxpipe's built-in defaults
   const models = cfg.models;
   if (process.env.PXPIPE_MODELS === undefined) {
     if (Array.isArray(models)) process.env.PXPIPE_MODELS = models.join(',') || 'off';

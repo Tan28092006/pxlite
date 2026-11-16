@@ -60,7 +60,7 @@ pxlite also listens on `127.0.0.1:47822` as an `HTTPS_PROXY`; clients that trust
   Delete that line to talk to chatgpt.com directly.
 - `pxlite setup autostart` creates `Startup\pxlite.lnk`, which runs `~/.pxpipe/start-hidden.vbs` at logon; a second copy exits because the port is taken.
 
-Models imaged come from `~/.config/pxpipe/config.json`: Fable 5, Opus 5.5, Sonnet 5.5, Gemini, gpt-6.1-sol (and sol-fast), gpt-6.1-terra.
+Models imaged come from `~/.config/pxpipe/config.json`, or from the `config.default.json` that ships with pxlite when that file does not exist (copy it there to change the list): Fable 5, Opus 5.5, Sonnet 5.5, Gemini, gpt-6.1-sol (and sol-fast), gpt-6.1-terra.
 Sonnet 5.5 uses the same Spleen 5×8 profile as Opus 5.5 (no override since 2026-11-16). It reads 84–92 % of Vietnamese syllables, against 99 % on JetBrains Mono 14 (`vi-eval/RESULTS.md`); the user chose Spleen for the token saving.
 Terra is enabled at the user's request (2026-11-15) although pxpipe has no quality measurement for it; `gptProfiles` in that file gives it Sol's 14px JetBrains Mono / 84-column geometry instead of its built-in 5×8 grid, which collapsed Sol's gist recall to 20/98.
 A 4-file Codex check on terra answered every name and a 34-character `cache_id` correctly; that is one run, not a benchmark.
