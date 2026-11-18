@@ -17,11 +17,14 @@ import { classifyCompaction, decodeRequestBody, stripCacheBreakpoints } from './
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createRecall, describeResponsesShape } from './recall.mjs';
 import { createClaudeRecall } from './recall-claude.mjs';
-import { createSessionRecall, listSessions, sessionInfo } from './recall-session.mjs';
+import { listSessions, sessionInfo } from './recall-session.mjs';
+import { listOpenCodeSessions } from './recall-opencode-session.mjs';
+import { createRecallSessions } from './recall-sessions.mjs';
 
 // Set by serve() when recall is enabled; used by toWebRequest on request bodies.
 let recall = null; // OpenCode, Responses
 let claudeRecall = null; // Claude Code, Messages
+let chatRecall = null; // OpenCode providers on Chat Completions (opencode/*, e.g. deepseek)
 
 // Per-request flags read by proxyConfig.transform(), which pxpipe calls with no
 // arguments inside the request's async context.
@@ -47,10 +50,11 @@ if (cmd === 'classify') classifyCmd(process.argv.slice(3));
 else if (cmd === 'stop') stopCmd();
 else if (cmd === 'status') await statusCmd();
 else if (cmd === 'serve') { await ensureVendor(); await serve(); }
-else if (cmd === 'sessions') sessionsCmd(process.argv.slice(3));
+else if (cmd === 'sessions') await sessionsCmd(process.argv.slice(3));
 else if (cmd === 'setup') await (await import('./setup.mjs')).setupCmd(process.argv.slice(3), { pxliteMjs: fileURLToPath(import.meta.url), port: PORT, connectPort: CONNECT_PORT, stateDir: STATE_DIR });
+else if (cmd === 'recall-test') await (await import('./recall-test.mjs')).recallTest(process.argv.slice(3));
 else {
-  console.error('usage: pxlite [serve|stop|status|classify <file>...|sessions [--all] [words]|setup [claude-vscode|codex|opencode|autostart] [--undo] [--yes]]');
+  console.error('usage: pxlite [serve|stop|status|classify <file>...|sessions [--all] [words]|setup [claude-vscode|codex|opencode|autostart] [--undo] [--yes]|recall-test [--client ...] [--model ...] [--all] [--wait]]');
   process.exit(64);
 }
 
@@ -64,20 +68,32 @@ async function ensureVendor() {
 
 // Earlier Claude Code sessions of the current folder (or of every project with --all), newest
 // first: the names that "recall <words>" matches, and the ids it accepts.
-function sessionsCmd(args) {
+async function sessionsCmd(args) {
   const all = args.includes('--all');
   const words = args.filter((a) => a !== '--all').join(' ').toLowerCase().split(/\s+/).filter(Boolean);
   const projects = path.join(HOME, '.claude', 'projects');
-  const dirs = all ? fs.readdirSync(projects).map((n) => path.join(projects, n)) : [path.join(projects, process.cwd().replace(/[^A-Za-z0-9]/g, '-'))];
+  const dirs = all ? (fs.existsSync(projects) ? fs.readdirSync(projects).map((n) => path.join(projects, n)) : []) : [path.join(projects, process.cwd().replace(/[^A-Za-z0-9]/g, '-'))];
   const rows = dirs.flatMap((d) => listSessions(d).filter((s) => s.size >= 6000).slice(0, all ? 40 : 200).map((s) => ({ ...s, ...sessionInfo(s.file, s.size), project: path.basename(d) })));
   const shown = rows
     .filter((r) => words.every((w) => `${r.title}\n${r.first}`.toLowerCase().includes(w)))
     .sort((a, b) => b.mtimeMs - a.mtimeMs)
     .slice(0, 20);
-  if (!shown.length) console.log(all ? 'no sessions found' : `no sessions found for ${process.cwd()} (try --all)`);
   for (const r of shown) {
     const when = new Date(r.mtimeMs).toISOString().slice(0, 16).replace('T', ' ');
-    console.log(`${r.id.slice(0, 8)}  ${when}  ${String(Math.round(r.size / 1024)).padStart(6)} KB  ${r.title || r.first.slice(0, 60).replace(/\s+/g, ' ')}${all ? `  [${r.project}]` : ''}`);
+    console.log(`[claude] ${r.id.slice(0, 8)}  ${when}  ${String(Math.round(r.size / 1024)).padStart(6)} KB  ${r.title || r.first.slice(0, 60).replace(/\s+/g, ' ')}${all ? `  [${r.project}]` : ''}`);
+  }
+  try {
+    const oc = (await listOpenCodeSessions(all ? undefined : process.cwd()))
+      .filter((s) => words.every((w) => String(s.title ?? '').toLowerCase().includes(w)))
+      .slice(0, 20);
+    for (const s of oc) {
+      const when = new Date(s.time?.updated ?? 0).toISOString().slice(0, 16).replace('T', ' ');
+      console.log(`[opencode] ${s.id}  ${when}  ${s.title || 'untitled'}${all ? `  [${s.location?.directory ?? ''}]` : ''}`);
+    }
+    if (!shown.length && !oc.length) console.log(all ? 'no sessions found' : `no sessions found for ${process.cwd()} (try --all)`);
+  } catch (err) {
+    console.warn(`pxlite: OpenCode sessions unavailable: ${err.message}`);
+    if (!shown.length) process.exitCode = 1;
   }
 }
 
@@ -126,7 +142,8 @@ async function statusCmd() {
 function applyConfigFileModels() {
   const file = process.env.PXPIPE_CONFIG ?? path.join(HOME, '.config', 'pxpipe', 'config.json');
   // Without a user file, use the config.default.json that ships with pxlite (models imaged and the
-  // tuned gpt-6.1-terra profile), so a fresh install images the same models as the author's setup.
+  // Spleen 5x8 + 2px-row profile for every GPT-wire model), so a fresh install images the same
+  // models as the author's setup.
   const shipped = path.join(path.dirname(fileURLToPath(import.meta.url)), 'config.default.json');
   let cfg;
   for (const f of [file, shipped]) {
@@ -183,10 +200,20 @@ async function toWebRequest(req) {
   }
   const method = req.method ?? 'GET';
   const hasBody = method !== 'GET' && method !== 'HEAD';
-  const url = `http://${req.headers.host ?? 'localhost'}${req.url ?? '/'}`;
   const anthropicMessages = method === 'POST' && /^\/v1\/messages(\?|$)/.test(req.url ?? '');
   const responses = method === 'POST' && /^\/(backend-api\/codex|v1)\/responses(\?|$)/.test(req.url ?? '');
-  if (hasBody && (headers.has('content-encoding') || anthropicMessages || (responses && (DEBUG_SHAPE || recall)))) {
+  // OpenCode's own provider (`opencode/*`, e.g. deepseek) speaks Chat Completions at
+  // opencode.ai/inference/openai/v1. pxpipe only recognizes the canonical shape, so the
+  // request is rewritten to /v1/chat/completions and forwarded to the opencode base.
+  const openCodeChat = method === 'POST' && /^\/inference\/openai\/v1\/chat\/completions(\?|$)/.test(req.url ?? '');
+  const openCodeResponses = method === 'POST' && /^\/inference\/openai\/v1\/responses(\?|$)/.test(req.url ?? '');
+  const urlPath = openCodeChat
+    ? (req.url ?? '').replace(/^\/inference\/openai\/v1\/chat\/completions/, '/v1/chat/completions')
+    : openCodeResponses
+      ? (req.url ?? '').replace(/^\/inference\/openai\/v1\/responses/, '/v1/responses')
+      : req.url ?? '/';
+  const url = `http://${req.headers.host ?? 'localhost'}${urlPath}`;
+  if (hasBody && (headers.has('content-encoding') || anthropicMessages || (responses && (DEBUG_SHAPE || recall)) || (openCodeChat && chatRecall) || (openCodeResponses && recall))) {
     const chunks = [];
     for await (const c of req) chunks.push(c);
     const raw = Buffer.concat(chunks);
@@ -199,7 +226,7 @@ async function toWebRequest(req) {
     const c = anthropicMessages ? classifyCompaction(bytes) : { compact: false, where: null };
     // Recall: OpenCode Responses (recall.mjs) and Claude Code Messages after a
     // compaction (recall-claude.mjs); never on the compaction request itself.
-    const r = responses ? recall : anthropicMessages && !c.compact ? claudeRecall : null;
+    const r = openCodeChat ? chatRecall : responses || openCodeResponses ? recall : anthropicMessages && !c.compact ? claudeRecall : null;
     if (anthropicMessages && process.env.PXLITE_DEBUG_META) {
       try {
         const b = JSON.parse(bytes.toString('utf8'));
@@ -222,7 +249,7 @@ async function toWebRequest(req) {
     const request = new Request(url, { method, headers, body: bytes });
     request.pxliteCompact = c.compact;
     request.pxliteCompactWhere = c.where;
-    if (responses && DEBUG_SHAPE) debugShape('in', req.url, plain ?? raw, headers);
+    if ((responses || openCodeResponses) && DEBUG_SHAPE) debugShape('in', req.url, plain ?? raw, headers);
     return request;
   }
   const body = hasBody
@@ -295,7 +322,6 @@ async function serve() {
   // Recall after OpenAI server-side compaction (recall.mjs). Off with PXLITE_RECALL=0.
   if (!disabled && !/^(0|false|no|off)$/i.test(process.env.PXLITE_RECALL ?? '')) {
     const [{ renderTextToImages }, { openAIImageDetail }, { responsesItemsToTurns }] = await Promise.all([core('library.js'), core('openai.js'), core('openai-history.js')]);
-    const prefixes = (process.env.PXLITE_RECALL_MODELS ?? 'gpt-6.1-sol,gpt-6.1-terra').split(',').map((s) => s.trim()).filter(Boolean);
     const r = createRecall({
       dir: path.join(STATE_DIR, 'recall'),
       toTurns: responsesItemsToTurns,
@@ -314,20 +340,34 @@ async function serve() {
     // Recall only for models pxpipe itself images (config.json / PXPIPE_MODELS), so a model
     // outside that scope, such as Haiku, never receives images it was not validated for.
     const { isPxpipeSupportedModel } = await core('applicability.js');
-    // "recall <name>" typed in a new session (recall-session.mjs) first, else the post-compaction recall.
-    const sr = createSessionRecall({
+    // "recall <name>" typed in a new session (recall-sessions.mjs): one implementation for
+    // every client and request shape, Claude Code sessions and OpenCode sessions are
+    // interchangeable candidates of the same directory. Falls back to the post-compaction recalls.
+    const sr = createRecallSessions({
       render: async (text, model) => (await renderTextToImages(text, { model, reflow: true })).pages,
       maxChars: Number(process.env.PXLITE_RECALL_MAX_CHARS ?? 200_000),
       maxImages: Number(process.env.PXLITE_RECALL_SESSION_MAX_IMAGES ?? 12),
     });
-    stats.sessionRecall = sr.stats;
+    stats.sessionRecall = sr.stats.claude;
+    stats.openCodeSessionRecall = sr.stats.opencode;
+    chatRecall = {
+      apply: async (body, headers) => (isPxpipeSupportedModel(String(body?.model ?? '')) ? sr.apply(body, headers, 'chat') : null),
+    };
     claudeRecall = { apply: async (body, headers) => (isPxpipeSupportedModel(String(body?.model ?? '')) ? (await sr.apply(body, headers)) ?? cr.apply(body) : null) };
     recall = {
-      // OpenCode only (user's choice 2026-11-15): Codex marks its requests with an
-      // `originator` header (codex_cli_rs, Codex Desktop …) and has its own compaction.
+      // Codex marks its requests with an `originator` header (codex_cli_rs, Codex Desktop …)
+      // and has its own compaction.
       apply: async (body, headers) => {
         if (/codex/i.test(headers?.get?.('originator') ?? '')) return null;
-        return prefixes.some((p) => String(body?.model ?? '').startsWith(p)) ? r.apply(body, headers) : null;
+        if (!isPxpipeSupportedModel(String(body?.model ?? ''))) return null;
+        const withCompaction = await r.apply(body, headers);
+        try {
+          return (await sr.apply(withCompaction ?? body, headers)) ?? withCompaction;
+        } catch (err) {
+          sr.stats.opencode.failed++;
+          console.warn(`[pxlite] session recall skipped: ${err.message}`);
+          return withCompaction;
+        }
       },
     };
   }
@@ -365,6 +405,10 @@ async function serve() {
   // Codex and OpenCode with a ChatGPT login call chatgpt.com/backend-api/codex/*;
   // pxpipe forwards OpenAI-shaped paths to one OpenAI base, so give them their own.
   const handleChatGPT = createProxy({ ...proxyConfig, openAIUpstream: 'https://chatgpt.com' });
+  // OpenCode's own provider (opencode/*, e.g. deepseek): canonical Chat Completions is
+  // rewritten to /v1/chat/completions in toWebRequest, so only the base differs.
+  // PXLITE_OPENCODE_UPSTREAM exists so test-serve.mjs can point it at a local server.
+  const handleOpenCode = createProxy({ ...proxyConfig, openAIUpstream: process.env.PXLITE_OPENCODE_UPSTREAM ?? 'https://opencode.ai/inference/openai' });
   // pxpipe's Sol profile marks an explicit `prompt_cache_breakpoint`; both the
   // ChatGPT Codex backend and api.openai.com reject it for gpt-6.1-sol(-fast) with a
   // 400. pxpipe calls the global fetch, so strip that key on Responses routes.
@@ -378,7 +422,7 @@ async function serve() {
     }
     return nativeFetch(input, init);
   };
-  const pickHandler = (url) => (url?.startsWith('/backend-api/') ? handleChatGPT : handle);
+  const pickHandler = (url) => (url?.startsWith('/backend-api/') ? handleChatGPT : url?.startsWith('/inference/openai/') ? handleOpenCode : handle);
 
   // Persistent HTTPS_PROXY endpoint (what `pxpipe warp` builds per child): clients
   // that cannot be wrapped (VS Code extension, desktop apps) point HTTPS_PROXY here
@@ -396,6 +440,9 @@ async function serve() {
     // responses only: analytics and other backend-api calls must tunnel untouched
     'chatgpt.com/backend-api/codex/responses*',
     'api.openai.com/v1/responses*',
+    // OpenCode's own provider (opencode/*, e.g. deepseek) uses Chat Completions or Responses.
+    'opencode.ai/inference/openai/v1/chat/completions*',
+    'opencode.ai/inference/openai/v1/responses*',
     'daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent*',
     'daily-cloudcode-pa.googleapis.com/v1internal:generateContent*',
     'generativelanguage.googleapis.com/v1beta/models/*:streamGenerateContent*',

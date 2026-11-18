@@ -48,7 +48,7 @@ pxpipe stats                     # savings report; reads the same events.jsonl
 
 ## Other clients
 
-pxlite also listens on `127.0.0.1:47822` as an `HTTPS_PROXY`; clients that trust `~/.pxpipe/warp-ca-bundle.pem` get Anthropic and OpenAI Responses calls diverted into pxlite, and every other host is tunnelled untouched.
+pxlite also listens on `127.0.0.1:47822` as an `HTTPS_PROXY`; clients that trust `~/.pxpipe/warp-ca-bundle.pem` get Anthropic Messages, OpenAI Responses, and OpenCode's own Chat Completions calls diverted into pxlite, and every other host is tunnelled untouched.
 
 - **Claude Code in VS Code** (`pxlite setup claude-vscode`): `claudeCode.environmentVariables` in VS Code user settings sets `HTTPS_PROXY` and `NODE_EXTRA_CA_CERTS`; takes effect for new Claude sessions.
 - **OpenCode desktop** (`pxlite setup opencode`): open the Desktop shortcut "OpenCode (pxlite)" after quitting OpenCode; the background service only inherits the variables at start.
@@ -60,27 +60,49 @@ pxlite also listens on `127.0.0.1:47822` as an `HTTPS_PROXY`; clients that trust
   Delete that line to talk to chatgpt.com directly.
 - `pxlite setup autostart` creates `Startup\pxlite.lnk`, which runs `~/.pxpipe/start-hidden.vbs` at logon; a second copy exits because the port is taken.
 
-Models imaged come from `~/.config/pxpipe/config.json`, or from the `config.default.json` that ships with pxlite when that file does not exist (copy it there to change the list): Fable 5, Opus 5.5, Sonnet 5.5, Gemini, gpt-6.1-sol (and sol-fast), gpt-6.1-terra.
-Sonnet 5.5 uses the same Spleen 5×8 profile as Opus 5.5 (no override since 2026-11-16). It reads 84–92 % of Vietnamese syllables, against 99 % on JetBrains Mono 14 (`vi-eval/RESULTS.md`); the user chose Spleen for the token saving.
-Terra is enabled at the user's request (2026-11-15) although pxpipe has no quality measurement for it; `gptProfiles` in that file gives it Sol's 14px JetBrains Mono / 84-column geometry instead of its built-in 5×8 grid, which collapsed Sol's gist recall to 20/98.
-A 4-file Codex check on terra answered every name and a 34-character `cache_id` correctly; that is one run, not a benchmark.
+Models imaged come from `~/.config/pxpipe/config.json`, or from the `config.default.json` that ships with pxlite when that file does not exist (copy it there to change the list): Fable 5, Opus 5.5, Sonnet 5.5, Gemini, gpt-6.1-sol (and sol-fast), gpt-6.1-terra, deepseek.
+OpenCode's own provider (`opencode/*`, for example `opencode/deepseek-v4.1-flash-free`) speaks Chat Completions at `opencode.ai/inference/openai/v1`; pxlite diverts that path too and rewrites it to pxpipe's canonical `/v1/chat/completions`.
+Every imaged model is drawn in Spleen 5×8 with 2 px added to each row (user's choice 2026-11-18, for the token saving).
+Claude models get it from pxpipe's spaced Claude profile; Sol, Terra and DeepSeek get it from `gptProfiles` in the config file (`spleen-5x8`, `cellHBonus` 2, 84 columns, 1954 px pages), which replaces the 14px JetBrains Mono geometry pxlite used for them before.
+Gemini keeps pxpipe's measured profile, which is Spleen 5×8 without the extra 2 px; that profile is not overridable from the config.
+Spleen reads 84–92 % of Vietnamese syllables on Sonnet 5.5, against 99 % on JetBrains Mono 14 (`vi-eval/RESULTS.md`).
+Two measurements argue for caution outside Claude: an image probe at plain Spleen 5×8 made DeepSeek V4.1 Flash Free misread `Y→9` and `O→0`, and pxpipe's own eval collapsed Sol's gist recall to 20/98 on its built-in 5×8 grid.
+The 2 px row spacing lifted Claude from 84/98 to 93/98 gist (pxpipe `claude-model-profiles.js`); it has not been measured on Sol, Terra or DeepSeek.
+Terra is enabled at the user's request (2026-11-15) although pxpipe has no quality measurement for it.
+A 4-file Codex check on terra answered every name and a 34-character `cache_id` correctly; that is one run, not a benchmark, and it ran under the earlier 14px profile.
 gpt-6.1-luna still passes through.
 pxlite strips `prompt_cache_breakpoint` from Responses requests because both the ChatGPT backend and api.openai.com reject it for Sol.
 The data-stays-text filter (`keepSharp`) exists only on pxpipe's Anthropic path; GPT history is imaged without it.
 
-## Recall an earlier session (Claude Code, 2026-11-16)
+## Recall an earlier session (Claude Code + OpenCode, 2026-11-17)
 
-Open a new session and type `recall` as the whole message.
-pxlite finds the latest earlier session of the same project that has at least 3 real prompts, renders its turns as images (user prompts, `[Edit] path` lines and final answers; tool calls and results dropped) and attaches them to the first message.
+Open a new session in either client and type `recall` as the whole message.
+pxlite finds the latest earlier session of the same project, renders its turns as images (user prompts, `[Edit] path` lines and final answers; tool calls and results dropped) and attaches them to the first message.
 The model says which session it loaded and asks what to do next.
 
+- Sessions are interchangeable: a Claude Code session can load an OpenCode session of the same directory and vice versa; candidates of both sources are ranked by update time.
 - `recall <words>`: the latest session whose title or opening prompt holds every word.
-- `recall <id>`: a session id or its first 6+ hex characters.
-- `pxlite sessions [--all] [words]`: lists names and ids (`--all` covers every project).
+- `recall <id>`: an OpenCode `ses_…` id or a Claude Code session uuid or its first 6+ characters.
+- `pxlite sessions [--all] [words]`: lists names and ids of both sources (`--all` covers every project).
 - A miss attaches no images and lists the recent sessions; type `recall <id>` after it (the last command wins).
-- The choice is pinned per session id (`~/.pxpipe/recall-pins.json`), so a newer session appearing later cannot change the bytes and break the cache.
-- Only for models pxpipe images (config scope). Size bounds: `PXLITE_RECALL_SESSION_MAX_IMAGES` (12), `PXLITE_RECALL_MAX_CHARS` (200000).
+- The chosen turns are pinned per session and query in `~/.pxpipe/recall-pins-any/` as plaintext (mode 0600, newest 50 kept), so a newer session appearing later cannot change the bytes and break the cache; the source transcript may even be deleted afterwards.
+- Runs for every model pxpipe images (config scope) and in every request shape: Anthropic Messages, Responses, and Chat Completions (`opencode/*`). Codex requests are excluded. Size bounds: `PXLITE_RECALL_SESSION_MAX_IMAGES` (12), `PXLITE_RECALL_MAX_CHARS` (200000).
+- The recall turn is answered from the images alone: `tools`, `tool_choice` and `parallel_tool_calls` are removed from that one request, so the model cannot open a transcript or DB instead of reading. The next request carries them again. `PXLITE_RECALL_KEEP_TOOLS=1` keeps them.
+- `pxlite status` reports `sessionRecall` (Claude Code context) and `openCodeSessionRecall` (OpenCode context); both count every injection, whichever client's session was loaded.
 - Collapsed history now drops tool calls and results too, and a compaction summary stays whole: see `patches/README.md`.
+
+### Testing recall
+
+`pxlite recall-test [--client opencode|claude|all] [--model <id>]... [--all] [--wait]`
+
+For each model a random password is written into a source session, the run that follows types `recall …`, and the answer must contain the password.
+The OpenCode default matrix is `gpt-6.1-sol`, `gpt-6.1-terra` and `opencode/deepseek-v4.1-flash-free`; `--model` takes provider-qualified ids as written in OpenCode.
+The password can only come from the compressed images: the requesting session never sees the source.
+Test sessions and any pin holding the password are deleted afterwards.
+`--wait` blocks until the proxy has been restarted with the current `pxlite.mjs`; without it the command warns when the running proxy is stale.
+
+The OpenCode API is read-only (no direct DB access). `PXLITE_OPENCODE_CLI` overrides the executable path.
+The OpenCode message API keeps at most the newest 600 messages; recall retains the latest compaction summary and the user/assistant text after it, omitting tool contents, reasoning and synthetic messages.
 
 ## Undo
 
@@ -129,4 +151,4 @@ Details, raw numbers and rebuild steps: `vi-eval/RESULTS.md`.
   The skill list and tool docs are imaged on every request as part of the static slab; reference files a skill makes the model `Read` are tool_results and go through the classifier.
 - pxlite imports pxpipe's `dist/core` files directly; it warns when the installed version is not 0.16.0.
 
-Tests: `node --test test.mjs`.
+Tests: `npm test` (`node --test test.mjs test-recall-sessions.mjs test-opencode-session.mjs test-serve.mjs`; needs the built `vendor/`).
