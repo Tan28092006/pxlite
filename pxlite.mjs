@@ -224,6 +224,12 @@ async function toWebRequest(req) {
     }
     let bytes = plain ?? raw;
     const c = anthropicMessages ? classifyCompaction(bytes) : { compact: false, where: null };
+    let tags = null;
+    if (anthropicMessages) {
+      try {
+        tags = claudeRequestTags(JSON.parse(bytes.toString('utf8')), headers);
+      } catch {}
+    }
     // Recall: OpenCode Responses (recall.mjs) and Claude Code Messages after a
     // compaction (recall-claude.mjs); never on the compaction request itself.
     const r = openCodeChat ? chatRecall : responses || openCodeResponses ? recall : anthropicMessages && !c.compact ? claudeRecall : null;
@@ -249,6 +255,7 @@ async function toWebRequest(req) {
     const request = new Request(url, { method, headers, body: bytes });
     request.pxliteCompact = c.compact;
     request.pxliteCompactWhere = c.where;
+    request.pxliteTags = tags;
     if ((responses || openCodeResponses) && DEBUG_SHAPE) debugShape('in', req.url, plain ?? raw, headers);
     return request;
   }
@@ -292,6 +299,33 @@ async function writeWebResponse(res, out) {
   } finally {
     out.off('close', cancel);
   }
+}
+
+// Labels for a Claude Messages request in events.jsonl, so cost reports can split
+// tokens by session and body kind. Ids and labels only, never prompt text.
+// session_id: header x-claude-code-session-id, else metadata.user_id JSON .session_id.
+// agent_role: Claude Code sends x-claude-code-agent-id only on subagent requests
+// (measured 2026-11-18, claude-cli 2.1.310: every subagent turn had it, no main-loop
+// request did). Without the session header the client is not Claude Code: unknown.
+// body_kind: delta when the body carries no tools and its system prompt, billing
+// line excluded, is under 2000 chars (pxpipe's "new part only" body); else full.
+const BILLING_LINE = 'x-anthropic-billing-header';
+const DELTA_SYSTEM_MAX = 2000;
+function claudeRequestTags(body, headers) {
+  const tags = {};
+  let sid = headers.get('x-claude-code-session-id');
+  if (!sid) {
+    try {
+      sid = JSON.parse(body?.metadata?.user_id ?? '{}')?.session_id;
+    } catch {}
+  }
+  if (typeof sid === 'string' && sid) tags.session_id = sid;
+  tags.agent_role = headers.get('x-claude-code-agent-id') ? 'subagent' : headers.get('x-claude-code-session-id') ? 'main' : 'unknown';
+  const sys = typeof body?.system === 'string' ? [{ text: body.system }] : Array.isArray(body?.system) ? body.system : [];
+  const sysChars = sys.reduce((n, b) => (typeof b?.text !== 'string' || b.text.startsWith(BILLING_LINE) ? n : n + b.text.length), 0);
+  const hasTools = Array.isArray(body?.tools) && body.tools.length > 0;
+  tags.body_kind = !hasTools && sysChars < DELTA_SYSTEM_MAX ? 'delta' : 'full';
+  return tags;
 }
 
 function slimEvent(ev) {
@@ -391,7 +425,7 @@ async function serve() {
         stats.imageBytes += e.info.imageBytes ?? 0;
       }
       try {
-        log.write(slimEvent(toTrackEvent(e)));
+        log.write(slimEvent({ ...toTrackEvent(e), ...requestCtx.getStore()?.tags }));
       } catch (err) {
         console.warn(`[pxlite] event log write failed: ${err.message}`);
       }
@@ -401,7 +435,8 @@ async function serve() {
       }
     },
   };
-  const handle = createProxy(proxyConfig);
+  // PXLITE_ANTHROPIC_UPSTREAM exists so test-serve.mjs can point it at a local server.
+  const handle = createProxy({ ...proxyConfig, upstream: process.env.PXLITE_ANTHROPIC_UPSTREAM });
   // Codex and OpenCode with a ChatGPT login call chatgpt.com/backend-api/codex/*;
   // pxpipe forwards OpenAI-shaped paths to one OpenAI base, so give them their own.
   const handleChatGPT = createProxy({ ...proxyConfig, openAIUpstream: 'https://chatgpt.com' });
@@ -489,7 +524,7 @@ async function serve() {
           stats.compactMarkerElsewhere[webReq.pxliteCompactWhere] = (stats.compactMarkerElsewhere[webReq.pxliteCompactWhere] ?? 0) + 1;
         }
         const handler = pickHandler(req.url);
-        await writeWebResponse(await requestCtx.run({ compact }, () => handler(webReq)), res);
+        await writeWebResponse(await requestCtx.run({ compact, tags: webReq.pxliteTags }, () => handler(webReq)), res);
       })
       .catch((err) => {
         console.error('[pxlite] handler error:', err);
