@@ -17,6 +17,7 @@ import { classifyCompaction, decodeRequestBody, stripCacheBreakpoints } from './
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createRecall, describeResponsesShape } from './recall.mjs';
 import { createClaudeRecall } from './recall-claude.mjs';
+import { createBlockDedupe, parseDedupeTags } from './dedupe-blocks.mjs';
 import { listSessions, sessionInfo } from './recall-session.mjs';
 import { listOpenCodeSessions } from './recall-opencode-session.mjs';
 import { createRecallSessions } from './recall-sessions.mjs';
@@ -25,6 +26,7 @@ import { createRecallSessions } from './recall-sessions.mjs';
 let recall = null; // OpenCode, Responses
 let claudeRecall = null; // Claude Code, Messages
 let chatRecall = null; // OpenCode providers on Chat Completions (opencode/*, e.g. deepseek)
+let claudeDedupe = null; // repeated injected blocks in Claude Messages (dedupe-blocks.mjs)
 
 // Per-request flags read by proxyConfig.transform(), which pxpipe calls with no
 // arguments inside the request's async context.
@@ -226,9 +228,25 @@ async function toWebRequest(req) {
     const c = anthropicMessages ? classifyCompaction(bytes) : { compact: false, where: null };
     let tags = null;
     if (anthropicMessages) {
+      let parsed;
       try {
-        tags = claudeRequestTags(JSON.parse(bytes.toString('utf8')), headers);
+        parsed = JSON.parse(bytes.toString('utf8'));
       } catch {}
+      // Headers are read even when the body does not parse, so the session id survives.
+      tags = claudeRequestTags(parsed, headers);
+      if (parsed && claudeDedupe) {
+        try {
+          // One conversation = session id plus subagent id: a subagent has its own server-side history.
+          const sessionKey = tags.session_id ? `${tags.session_id}\u0000${headers.get('x-claude-code-agent-id') ?? ''}` : null;
+          if (claudeDedupe.apply(parsed, { sessionKey, bodyKind: tags.body_kind }) > 0) {
+            bytes = Buffer.from(JSON.stringify(parsed));
+            headers.set('content-length', String(bytes.byteLength));
+          }
+        } catch (err) {
+          // Dedupe must never break a request: forward the body as it was.
+          console.warn(`[pxlite] dedupe skipped: ${err.message}`);
+        }
+      }
     }
     // Recall: OpenCode Responses (recall.mjs) and Claude Code Messages after a
     // compaction (recall-claude.mjs); never on the compaction request itself.
@@ -311,6 +329,8 @@ async function writeWebResponse(res, out) {
 // line excluded, is under 2000 chars (pxpipe's "new part only" body); else full.
 const BILLING_LINE = 'x-anthropic-billing-header';
 const DELTA_SYSTEM_MAX = 2000;
+// body is undefined when the request body is not JSON: session_id and agent_role still come
+// from the headers, body_kind is left out.
 function claudeRequestTags(body, headers) {
   const tags = {};
   let sid = headers.get('x-claude-code-session-id');
@@ -321,6 +341,7 @@ function claudeRequestTags(body, headers) {
   }
   if (typeof sid === 'string' && sid) tags.session_id = sid;
   tags.agent_role = headers.get('x-claude-code-agent-id') ? 'subagent' : headers.get('x-claude-code-session-id') ? 'main' : 'unknown';
+  if (!body || typeof body !== 'object') return tags;
   const sys = typeof body?.system === 'string' ? [{ text: body.system }] : Array.isArray(body?.system) ? body.system : [];
   const sysChars = sys.reduce((n, b) => (typeof b?.text !== 'string' || b.text.startsWith(BILLING_LINE) ? n : n + b.text.length), 0);
   const hasTools = Array.isArray(body?.tools) && body.tools.length > 0;
@@ -352,6 +373,16 @@ async function serve() {
   });
   const disabled = /^(1|true|yes|on)$/i.test(process.env.PXPIPE_DISABLE ?? '');
   const stats = { started: new Date().toISOString(), requests: 0, compressed: 0, keptText: {}, imageBytes: 0 };
+
+  // Repeated injected blocks (dedupe-blocks.mjs), only for models pxpipe images.
+  // PXLITE_DEDUPE_TAGS: comma-separated tag names, default browser_instruction; '' or 0 = off.
+  const dedupeTags = parseDedupeTags(process.env.PXLITE_DEDUPE_TAGS);
+  if (!disabled && dedupeTags.length) {
+    const { isPxpipeSupportedModel } = await core('applicability.js');
+    const d = createBlockDedupe({ tags: dedupeTags });
+    stats.dedupe = d.stats;
+    claudeDedupe = { apply: (body, opts) => (isPxpipeSupportedModel(String(body?.model ?? '')) ? d.apply(body, opts) : 0) };
+  }
 
   // Recall after OpenAI server-side compaction (recall.mjs). Off with PXLITE_RECALL=0.
   if (!disabled && !/^(0|false|no|off)$/i.test(process.env.PXLITE_RECALL ?? '')) {
@@ -436,14 +467,15 @@ async function serve() {
     },
   };
   // PXLITE_ANTHROPIC_UPSTREAM exists so test-serve.mjs can point it at a local server.
-  const handle = createProxy({ ...proxyConfig, upstream: process.env.PXLITE_ANTHROPIC_UPSTREAM });
+  // Set but empty (or blank) counts as unset: pxpipe's default upstream.
+  const handle = createProxy({ ...proxyConfig, upstream: process.env.PXLITE_ANTHROPIC_UPSTREAM?.trim() || undefined });
   // Codex and OpenCode with a ChatGPT login call chatgpt.com/backend-api/codex/*;
   // pxpipe forwards OpenAI-shaped paths to one OpenAI base, so give them their own.
   const handleChatGPT = createProxy({ ...proxyConfig, openAIUpstream: 'https://chatgpt.com' });
   // OpenCode's own provider (opencode/*, e.g. deepseek): canonical Chat Completions is
   // rewritten to /v1/chat/completions in toWebRequest, so only the base differs.
   // PXLITE_OPENCODE_UPSTREAM exists so test-serve.mjs can point it at a local server.
-  const handleOpenCode = createProxy({ ...proxyConfig, openAIUpstream: process.env.PXLITE_OPENCODE_UPSTREAM ?? 'https://opencode.ai/inference/openai' });
+  const handleOpenCode = createProxy({ ...proxyConfig, openAIUpstream: process.env.PXLITE_OPENCODE_UPSTREAM?.trim() || 'https://opencode.ai/inference/openai' });
   // pxpipe's Sol profile marks an explicit `prompt_cache_breakpoint`; both the
   // ChatGPT Codex backend and api.openai.com reject it for gpt-6.1-sol(-fast) with a
   // 400. pxpipe calls the global fetch, so strip that key on Responses routes.

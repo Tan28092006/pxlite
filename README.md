@@ -130,6 +130,8 @@ Details, raw numbers and rebuild steps: `vi-eval/RESULTS.md`.
   It costs one full-text request per compaction; `PXLITE_COMPACT_IMAGES=1` turns imaging back on.
   Verified for `/compact`; auto-compact is precomputed in the background (`compactMetadata.precomputed`) and could not be forced in `-p` mode, so it is unverified.
   Any request that carries the summary phrase but is not treated as compaction is counted by position in `compactMarkerElsewhere` in `pxlite status`; a `last-user`-like position there after a real auto-compact means a missed shape.
+- **Repeated injected blocks are sent once (Claude Code).**
+  A block pasted verbatim into many user messages (`<browser_instruction>…</browser_instruction>`) keeps its first copy per session; later copies become one marker line, text typed next to it stays; `PXLITE_DEDUPE_TAGS` lists the tags (comma-separated, default `browser_instruction`, empty or `0` = off).
 - **Recall after compaction (OpenCode sol/terra, Claude Code).**
   After a compaction, pxlite inserts the turns that compaction removed as images right after the summary, with a note that the summary, later turns and current files win.
   Only the latest compaction is recalled; tool outputs, thinking and reminders are dropped, tool calls kept as one line.
