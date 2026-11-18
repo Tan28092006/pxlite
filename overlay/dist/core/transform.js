@@ -741,6 +741,91 @@ function relocateAnchorToHistoryImage(messages, anchorOrdinal) {
     historyImg.cache_control = demoteRelocatedCacheControl(slabAnchor.cache_control);
     delete slabAnchor.cache_control;
 }
+/** Anthropic rejects a request with more than 4 cache_control breakpoints. */
+export const MAX_CACHE_BREAKPOINTS = 4;
+/**
+ * pxlite: give the LAST history image its own cache breakpoint.
+ *
+ * This deliberately breaks upstream's "never add a marker" rule (see
+ * makeImageBlock), for one measured reason. Without it the history images are
+ * covered only by the client's current-turn marker, which sits 47-108 blocks
+ * after them, while the server looks back only ~20 blocks for an earlier entry.
+ * The prior turn's entry is then reachable only when the body grew append-only.
+ * When the client rewrites its tail instead (Claude Code retrying an empty
+ * response rewrote 2 of 97 messages; log 2026-11-18 06:32, history_image_sha8
+ * 9dc38b57), every request re-wrote 72-80k tokens of identical history and read
+ * only the 12,580-token slab entry. When collapseHistory finds no frozen
+ * carry-over chunk (freeze step >= collapsed range), the slab anchor never moves
+ * to the history, so nothing else covers it. A marker on the last history image
+ * makes slab + history one entry the next request reads.
+ *
+ * Adds only when the client already marks a block after the history image: those
+ * tokens are written to cache anyway, so the extra breakpoint costs nothing. The
+ * TTL is copied from the nearest following marker, so TTLs stay non-increasing in
+ * wire order. If the request would exceed {@link MAX_CACHE_BREAKPOINTS}, the
+ * marker removed is the latest one in wire order other than the new one and the
+ * client's final marker. In the live tail, the final marker's lookback still
+ * reaches its entry when the body grew append-only. Before the history image (the
+ * slab anchor), it caches a prefix of the new entry. The final marker is never removed.
+ * Returns true when it changed the request.
+ */
+export function markLastHistoryImage(req) {
+    const msgs = req.messages; // callers run this only after a collapse, so it is an array
+    let lastHistoryImage;
+    for (const m of msgs) {
+        if (!Array.isArray(m.content))
+            continue;
+        const first = m.content[0];
+        if (!first || first.type !== 'text' || first.text !== HISTORY_SYNTHETIC_INTRO)
+            continue;
+        for (const b of m.content)
+            if (b && b.type === 'image')
+                lastHistoryImage = b;
+        break;
+    }
+    if (!lastHistoryImage || lastHistoryImage.cache_control !== undefined)
+        return false;
+    // Every marked block in wire order: tools, system, then message blocks. A
+    // tool_result's nested blocks precede the tool_result's own end.
+    const marked = [];
+    const hasMark = (b) => b && typeof b === 'object' && b.cache_control !== undefined;
+    for (const t of Array.isArray(req.tools) ? req.tools : [])
+        if (hasMark(t))
+            marked.push(t);
+    for (const b of Array.isArray(req.system) ? req.system : [])
+        if (hasMark(b))
+            marked.push(b);
+    let historyPos = -1;
+    for (const m of msgs) {
+        if (!Array.isArray(m.content))
+            continue;
+        for (const b of m.content) {
+            if (b === lastHistoryImage)
+                historyPos = marked.length;
+            if (b && b.type === 'tool_result' && Array.isArray(b.content))
+                for (const inner of b.content)
+                    if (hasMark(inner))
+                        marked.push(inner);
+            if (hasMark(b))
+                marked.push(b);
+        }
+    }
+    const following = marked.slice(historyPos); // historyPos is set: the image was found in msgs above
+    if (following.length === 0)
+        return false; // no client marker after the history → client did not ask to cache it
+    if (marked.length > MAX_CACHE_BREAKPOINTS)
+        return false; // already invalid upstream; do not touch
+    const src = following[0].cache_control;
+    lastHistoryImage.cache_control = src?.ttl !== undefined
+        ? { type: 'ephemeral', ttl: src.ttl }
+        : { type: 'ephemeral' };
+    if (marked.length + 1 > MAX_CACHE_BREAKPOINTS) {
+        // Candidates: every marker except the client's final one; the new one is not in `marked`.
+        const drop = marked[marked.length - 2];
+        delete drop.cache_control;
+    }
+    return true;
+}
 /**
  * Read-only digest of the cacheable prefix pxpipe actually sends: tools +
  * system + message blocks up to and including the imaged history image (or, on
@@ -1772,6 +1857,9 @@ async function runHistoryCollapseAndFinalize(req, info, o, opts, droppedCodepoin
     const toolResultsImaged = o.compressToolResults
         ? await compressToolResultsInPlace(req, info, o, denseGateGeometry(o), droppedCodepoints)
         : false;
+    // pxlite: same as the main path — after every marker move, before the body is serialized.
+    if (collapsedFlag)
+        markLastHistoryImage(req);
     applyPins(req, info, pins);
     info.outgoingTextChars = countOutgoingTextChars(req);
     // Ground truth, counted from the bytes we are about to send. The provider only
@@ -2365,6 +2453,9 @@ export async function transformRequest(body, opts = {}) {
     // `imageHeadroom(info)` is the headroom left after the collapse spent its
     // share. Out of headroom degrades to sharp text, which is the safe direction.
     await compressToolResultsInPlace(req, info, o, denseGeo, droppedCodepoints);
+    // pxlite: after every marker move above, so the budget check sees final positions.
+    if (info.historyReason === 'collapsed')
+        markLastHistoryImage(req);
     // The volatile billing line is NOT re-emitted into the body at all. There is
     // no safe body position: req.system precedes the last cache_control marker
     // (#180/#161: 0 cache reads, 509/509 distinct cachePrefixSha8/day), and
