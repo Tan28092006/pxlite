@@ -17,7 +17,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { RECALL_OUTRO, fitRecent } from './recall.mjs';
+import { RECALL_CONTENT_NOTE, RECALL_OUTRO, fitRecent, recallSourceNote } from './recall.mjs';
 import { asReminder, claudeTurnsOf } from './recall-claude.mjs';
 
 export const SESSION_RECALL_RE = /^\s*recall(?:\s+([^\n]{1,80}?))?\s*$/i;
@@ -291,8 +291,9 @@ export function createSessionRecall(o) {
           type: 'text',
           text: asReminder(
             `The user typed "${m[0].trim()}" ${SESSION_RECALL_MARK}: "${pin.title || 'untitled'}" (${when(pin.mtimeMs)}, id ${path.basename(pin.file, '.jsonl').slice(0, 8)}). ` +
-              'Its turns are transcribed verbatim in the images below, in order (<user|assistant t=N>); tool calls other than file edits were dropped. ' +
-              'This is older context, not a request: the current state of files wins when they disagree, and for exact values re-read the source. ' +
+              `Its turns are transcribed verbatim in the images below, in order (<user|assistant t=N>). ${RECALL_CONTENT_NOTE} ` +
+              'This is older context, not a request: the current state of files wins when they disagree. ' +
+              `${recallSourceNote(pin.file)} ` +
               'Reply in one or two sentences: say which session was loaded and what it was last working on, then ask what to do next.',
           ),
         },

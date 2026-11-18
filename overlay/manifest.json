@@ -25,7 +25,7 @@
     {
       "path": "dist/core/history.js",
       "upstreamSha256": "248efa7743ebdb8754bc00adf6d1122194ecd7a35aed0c6f5695ae1318884811",
-      "overlaySha256": "932bbae3fba6fb0a8229116560dbcd5bdad7117c1e83d2c1f4281b0ff51f57d8"
+      "overlaySha256": "c4b1532faeda75be61de863be5f490c7f751e05916a2d04f1ca7f4e693a758cf"
     },
     {
       "path": "dist/core/tracker.js",

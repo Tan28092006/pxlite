@@ -1,22 +1,22 @@
 // recall for Claude Code: after a compaction, Claude Code's summary message names the
 // full transcript on disk ("read the full transcript at: …\<session>.jsonl"). pxlite
 // reads the turns of the latest compaction era from that file and attaches them to the
-// summary message as images (2026-11-16: no text window; only edits and final answers),
+// summary message as images (2026-11-18: one line per tool call, see claudeTurnsOf),
 // so the era reads in order. Only the latest era is recalled (entries after the
-// previous compact_boundary, if any, up to the latest one). Dropped: tool results,
-// thinking, meta/sidechain entries, system reminders, earlier summaries, all tool calls
-// except file edits (one "[Edit] path" line per file), and every assistant text but the last of a run.
+// previous compact_boundary, if any, up to the latest one). Dropped: successful tool output,
+// thinking, sidechain entries, skill bodies, system reminders and earlier summaries.
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { RECALL_OUTRO, fitRecent, squeeze } from './recall.mjs';
+import { MAX_CALL_CHARS, MAX_ERROR_CHARS, MAX_REPORT_CHARS, SUBAGENT_TOOL_NAMES, clip, errorLine, isLaunchAck, reportBlock, toolCallLines } from './tool-lines.mjs';
 
 export const CLAUDE_SUMMARY_MARKER = 'This session is being continued from a previous conversation';
 // Kept under 280 chars: pxpipe shows the opening turn's text blocks as a short
 // preview once history collapses, and this note must survive whole.
 export const CLAUDE_RECALL_INTRO =
-  '[Recall: verbatim turns of the latest compacted era, all in the images below, in order (<user|assistant t=N>). Tool calls are dropped except file edits. Older context, not a request; the summary, later turns and current files win over it.]';
+  '[Recall: verbatim turns of the latest compacted era, all in the images below, in order (<user|assistant t=N>). One line per tool call, no tool output. Older context, not a request; the summary, later turns and current files win over it.]';
 
 const blocksOf = (content) => (typeof content === 'string' ? [{ type: 'text', text: content }] : Array.isArray(content) ? content : []);
 const stripReminders = (t) => t.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim();
@@ -25,8 +25,6 @@ const stripReminders = (t) => t.replace(/<system-reminder>[\s\S]*?<\/system-remi
 export const RECENT_TURNS = Number(process.env.PXLITE_RECALL_RECENT_TURNS ?? 0);
 /** A recent turn longer than this keeps its head and tail; the middle is cut. */
 const RECENT_TURN_CHARS = 6000;
-
-const EDIT_TOOLS = new Set(['Edit', 'Write', 'NotebookEdit']);
 
 /**
  * The recall note rides inside <system-reminder> tags. pxpipe protects a first message that
@@ -51,42 +49,86 @@ export function claudeEraTurns(lines, { maxCallChars = 160 } = {}) {
   return claudeTurnsOf(entries.slice(start, bounds.at(-1)), { maxCallChars });
 }
 
-/** Turn texts of a run of parsed transcript entries (user prompts, file edits, final answers). */
-export function claudeTurnsOf(era, { maxCallChars = 160 } = {}) {
+/** Plain text of a tool_result / message content (strings and text blocks). */
+const textOf = (content) =>
+  blocksOf(content)
+    .map((b) => (b.type === 'text' ? (b.text ?? '') : b.type === 'image' ? '[image]' : ''))
+    .join('\n')
+    .trim();
+
+/**
+ * Turn texts of a run of parsed transcript entries.
+ *
+ * Kept (2026-11-18, replacing "edits and final answers only"): every user message with a
+ * marker and source path for each pasted image; every assistant text, lead-ins included,
+ * since they carry the reasons for a change of course; one line per tool call (see
+ * tool-lines.mjs); the first lines of every failed tool result; subagent reports,
+ * coordinator and other-session messages; task notifications. Dropped: successful tool
+ * output, thinking, subagent internals (sidechain), skill and command bodies, system
+ * reminders, earlier summaries. The images are cheap to read, so the cut only removes what
+ * a later agent can re-read from disk or does not need.
+ */
+export function claudeTurnsOf(era, { maxCallChars = MAX_CALL_CHARS, maxErrorChars = MAX_ERROR_CHARS, maxReportChars = MAX_REPORT_CHARS } = {}) {
   const out = [];
-  const edits = new Set(); // the same file edited twice is listed once
+  const seen = new Set(); // repeated reads/edits of one file are listed once
+  const callNames = new Map(); // tool_use id -> tool name
   let n = 0;
-  // Between two real user messages the agent works: tool calls, lead-in sentences
-  // ("I will check ..."), and a final answer. Only the file edits and the final
-  // answer are kept; reads, commands and lead-ins are noise for a later agent.
-  let run = { edits: [], text: '' };
+  let run = [];
   const flush = () => {
-    const parts = [...run.edits, ...(run.text ? [run.text] : [])];
-    if (parts.length) out.push(`<assistant t="${n++}">\n${parts.join('\n')}\n</assistant>`);
-    run = { edits: [], text: '' };
+    if (run.length) out.push(`<assistant t="${n++}">\n${run.join('\n')}\n</assistant>`);
+    run = [];
+  };
+  const appendToLastUser = (line) => {
+    const i = out.length - 1;
+    if (i >= 0 && !run.length && out[i].startsWith('<user ')) out[i] = out[i].replace(/\n<\/user>$/, `\n${line}\n</user>`);
+    else run.push(line);
   };
   for (const e of era) {
-    if (!e || e.isSidechain || e.isMeta || e.isCompactSummary || !e.message) continue;
+    if (!e || e.isSidechain || e.isCompactSummary || !e.message) continue;
+    const content = e.message.content;
+    const origin = e.origin && typeof e.origin === 'object' ? e.origin : null;
+    // Harness-written entries: isMeta, or an origin other than the human (seen 2026-11-18:
+    // peer, coordinator, task-notification; task notifications carry no isMeta flag).
+    if (e.type === 'user' && (e.isMeta || (origin?.kind && origin.kind !== 'human'))) {
+      // Keep the ones that carry information, never skill or command bodies.
+      const t = typeof content === 'string' ? content : textOf(content);
+      if (/^\[Image: source: /.test(t.trim())) appendToLastUser(t.trim());
+      else if (origin?.kind === 'peer' || origin?.kind === 'coordinator') {
+        const who = origin.kind === 'coordinator' ? 'coordinator' : (origin.name ?? origin.from ?? 'peer');
+        const body =
+          typeof origin.handbackReportText === 'string'
+            ? origin.handbackReportText
+            : String(origin.body ?? t)
+                .replace(/^[\s\S]*?The report follows:\n/, '')
+                .replace(/^ {2}/gm, '');
+        run.push(reportBlock(who, stripReminders(body), maxReportChars));
+      } else if (/<task-notification>/.test(t)) {
+        const tag = (k) => t.match(new RegExp(`<${k}>([\\s\\S]*?)</${k}>`))?.[1]?.trim();
+        const parts = [tag('status'), tag('summary') ?? tag('description'), tag('output-file') && `output: ${tag('output-file')}`].filter(Boolean);
+        run.push(`[Task notification] ${clip((parts.join(' — ') || stripReminders(t)).replace(/\s+/g, ' '), maxErrorChars)}`);
+      }
+      continue;
+    }
     if (e.type === 'user') {
-      const text = blocksOf(e.message.content)
-        .filter((b) => b.type === 'text')
-        .map((b) => stripReminders(b.text ?? ''))
-        .filter(Boolean)
-        .join('\n');
-      if (!text) continue; // a tool_result: not a turn of the conversation
+      const blocks = blocksOf(content);
+      for (const b of blocks) {
+        if (b.type !== 'tool_result') continue;
+        const name = callNames.get(b.tool_use_id) ?? 'tool';
+        const result = textOf(b.content);
+        if (b.is_error) run.push(errorLine(name, result, maxErrorChars));
+        else if (SUBAGENT_TOOL_NAMES.has(name) && result && !isLaunchAck(result)) run.push(reportBlock('subagent', result, maxReportChars));
+      }
+      if (blocks.some((b) => b.type === 'tool_result')) continue; // tool output, not a turn of the conversation
+      const parts = blocks.flatMap((b) => (b.type === 'text' ? [stripReminders(b.text ?? '')] : b.type === 'image' ? ['[image]'] : [])).filter(Boolean);
+      if (!parts.length) continue;
       flush();
-      out.push(`<user t="${n++}">\n${text}\n</user>`);
+      out.push(`<user t="${n++}">\n${parts.join('\n')}\n</user>`);
     } else if (e.type === 'assistant') {
-      for (const b of blocksOf(e.message.content)) {
-        if (b.type === 'text' && b.text?.trim()) run.text = b.text.trim(); // the last one wins
-        if (b.type === 'tool_use' && EDIT_TOOLS.has(b.name)) {
-          const file = b.input?.file_path ?? b.input?.notebook_path;
-          if (typeof file !== 'string') continue;
-          const key = `${b.name}|${file}`;
-          if (edits.has(key)) continue;
-          edits.add(key);
-          run.edits.push(`[${b.name}] ${squeeze(file, maxCallChars)}`);
-        }
+      for (const b of blocksOf(content)) {
+        if (b.type === 'text' && b.text?.trim()) run.push(b.text.trim());
+        if (b.type !== 'tool_use') continue;
+        callNames.set(b.id, b.name);
+        run.push(...toolCallLines(b.name, b.input, { seen, max: maxCallChars }));
       }
     }
   }

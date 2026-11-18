@@ -14,7 +14,12 @@ Tests that cover each change are the last tests of `test.mjs`.
    did, all Sonnet with the JetBrains Mono profile (about 423 KB per page against about 102 KB for Spleen),
    carrying 18 % of all cache-write tokens. The patch retries with a smaller image budget (up to 5 tries,
    oldest pages kept) before skipping. Events log gains `native_image_bytes`, `history_byte_trims`.
-2. **Tool calls dropped from collapsed history** (`history.js`). Tool results and tool calls are not rendered;
+2. **Tool calls shortened in collapsed history** (`history.js`). Since 2026-11-18 each tool call is one line from
+   `tool-lines.mjs` (shared with recall; imported as `../../../../tool-lines.mjs`), every assistant text stays
+   (lead-ins carry the reasons for a change of course), and of the tool output only failures (first 600 chars)
+   and subagent reports (6000 chars) are kept; a file read or edited many times is listed once.
+   Before that date only `[Edit] path` lines and answers survived (history kept for reference below).
+   Earlier version: tool results and tool calls are not rendered;
    a file edit stays as one `[Edit] path` line; assistant text that rides with a tool call (lead-ins) is
    dropped; assistant messages without a tool call (the answers) stay. On a real 175-message session the
    collapsed history went from 14 images / 12,115 image tokens to 6 images / 563 (collapsed characters

@@ -19,12 +19,31 @@ test('session selection stays in the current directory and rejects ambiguous ids
   assert.equal(selectOpenCodeSession(sessions, 'missing', ''), null);
 });
 
-test('transcript excludes tools, reasoning and synthetic instructions', () => {
+test('transcript excludes reasoning, tool output and non-subagent synthetic messages', () => {
   assert.deepEqual(openCodeTurns([
     { type: 'user', text: 'ask' },
     { type: 'synthetic', text: 'secret' },
-    { type: 'assistant', content: [{ type: 'reasoning', text: 'hidden' }, { type: 'tool', text: 'payload' }, { type: 'text', text: 'answer' }] },
-  ]), ['<user t="0">ask</user>', '<assistant t="1">answer</assistant>']);
+    { type: 'assistant', content: [{ type: 'reasoning', text: 'hidden' }, { type: 'tool', name: 'shell', state: { status: 'completed', input: { command: 'ls' }, content: [{ type: 'text', text: 'payload' }] } }, { type: 'text', text: 'answer' }] },
+  ]), ['<user t="0">\nask\n</user>', '<assistant t="1">\n[shell] ls\nanswer\n</assistant>']);
+});
+
+// Shapes from a real session (ses_e12c9644…, 2026-11-18).
+test('OpenCode turns keep one line per call, errors, subagent results and attachments', () => {
+  const tool = (name, input, extra = {}) => ({ type: 'tool', name, state: { status: 'completed', input, content: [{ type: 'text', text: 'OUTPUT-BODY' }], ...extra } });
+  const turns = openCodeTurns([
+    { type: 'user', text: 'look', files: [{ mime: 'image/png', name: 'image.png', data: 'AAAA' }, { mime: 'application/pdf', name: 'spec.pdf', data: 'BBBB' }] },
+    { type: 'assistant', content: [{ type: 'text', text: 'lead-in' }, tool('skill', { id: 'workflow' }), tool('read', { path: 'D:\\x\\SPEC.md' }, { status: 'error', error: { message: 'File not found: SPEC.md' } })] },
+    { type: 'system', text: 'The Code Mode tool catalog has changed.' },
+    { type: 'assistant', content: [tool('patch', { patchText: '*** Begin Patch\n*** Update File: D:\\x\\TASKS.md\n@@\n-a\n+b\n*** End Patch' }), tool('subagent', { agent: 'general', description: 'T1', prompt: 'do T1' })] },
+    { type: 'synthetic', text: '<subagent sessionID="ses_c" state="cancelled" description="T1">\nSubagent cancelled\n</subagent>', description: 'T1', metadata: { source: 'subagent', agent: 'General', state: 'cancelled' } },
+    { type: 'idle', outcome: 'succeeded' },
+    { type: 'assistant', content: [{ type: 'text', text: 'final' }] },
+  ]);
+  const all = turns.join('\n');
+  assert.equal(turns.length, 2, 'consecutive assistant messages form one turn');
+  for (const kept of [/look\n\[image: image\.png\]\n\[file: spec\.pdf\]/, /lead-in/, /\[skill\] workflow/, /\[read\] D:\\x\\SPEC\.md/, /\[read error\] File not found: SPEC\.md/,
+    /\[patch\] Update D:\\x\\TASKS\.md/, /\[Subagent general\] T1: do T1/, /\[Message from subagent General \(cancelled\): T1\]\nSubagent cancelled/, /final\n<\/assistant>$/]) assert.match(all, kept);
+  for (const gone of [/OUTPUT-BODY/, /AAAA/, /tool catalog/, /\+b/, /<subagent /]) assert.doesNotMatch(all, gone);
 });
 
 test('last completed compaction summary replaces earlier era', () => {
@@ -32,7 +51,7 @@ test('last completed compaction summary replaces earlier era', () => {
     { type: 'user', text: 'obsolete' },
     { type: 'compaction', summary: 'summary' },
     { type: 'user', text: 'new request' },
-  ]), ['<earlier-summary>\nsummary\n</earlier-summary>', '<user t="1">new request</user>']);
+  ]), ['<earlier-summary>\nsummary\n</earlier-summary>', '<user t="0">\nnew request\n</user>']);
 });
 
 test('responses recall pins transcript and never attaches for unverified id', async () => {

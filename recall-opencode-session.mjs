@@ -6,6 +6,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fitRecent, RECALL_OUTRO } from './recall.mjs';
 import { SESSION_RECALL_RE } from './recall-session.mjs';
+import { errorLine, reportBlock, toolCallLines } from './tool-lines.mjs';
 
 const exec = promisify(execFile);
 const hash = (s) => crypto.createHash('sha256').update(s).digest('hex');
@@ -61,22 +62,54 @@ export function selectOpenCodeSession(sessions, sid, query) {
   return candidates.find((s) => words.every((w) => String(s.title ?? '').toLowerCase().includes(w))) ?? null;
 }
 
+/**
+ * Turn texts of an OpenCode session (message API shape, checked 2026-11-18), in the same
+ * format as claudeTurnsOf: user text plus a marker per attached file; every assistant text;
+ * one line per tool call (tool-lines.mjs); the first lines of a failed call; subagent
+ * results (synthetic messages). Consecutive assistant messages form one turn. Dropped:
+ * reasoning, successful tool output, skill bodies, system notices, idle markers.
+ */
 export function openCodeTurns(messages) {
   const turns = [];
   const boundary = messages.findLastIndex((m) => m.type === 'compaction' && typeof m.summary === 'string' && m.summary.trim());
   if (boundary >= 0) turns.push(`<earlier-summary>\n${messages[boundary].summary.trim()}\n</earlier-summary>`);
+  const seen = new Set();
+  let n = 0;
+  let run = [];
+  const flush = () => {
+    if (run.length) turns.push(`<assistant t="${n++}">\n${run.join('\n')}\n</assistant>`);
+    run = [];
+  };
   for (const m of messages.slice(boundary + 1)) {
-    let text = '';
-    if (m.type === 'user') text = m.text ?? '';
-    else if (m.type === 'assistant' && Array.isArray(m.content)) {
-      text = m.content.filter((p) => p.type === 'text').map((p) => p.text ?? '').join('\n');
+    if (m?.type === 'user') {
+      const files = (Array.isArray(m.files) ? m.files : []).map((f) =>
+        String(f?.mime ?? '').startsWith('image/') ? `[image${f?.name ? `: ${f.name}` : ''}]` : `[file: ${f?.name ?? f?.mime ?? 'attachment'}]`,
+      );
+      const text = [typeof m.text === 'string' ? m.text.trim() : '', ...files].filter(Boolean).join('\n');
+      if (!text) continue;
+      flush();
+      turns.push(`<user t="${n++}">\n${text}\n</user>`);
+    } else if (m?.type === 'assistant' && Array.isArray(m.content)) {
+      for (const p of m.content) {
+        if (p?.type === 'text' && typeof p.text === 'string' && p.text.trim()) run.push(p.text.trim());
+        if (p?.type !== 'tool') continue;
+        run.push(...toolCallLines(p.name, p.state?.input, { seen }));
+        if (p.state?.status === 'error') run.push(errorLine(p.name, p.state?.error?.message ?? safeText(p.state?.content)));
+      }
+    } else if (m?.type === 'synthetic' && typeof m.text === 'string' && m.metadata?.source === 'subagent') {
+      const state = m.metadata?.state ? ` (${m.metadata.state})` : '';
+      const body = m.text.replace(/^<subagent\b[^>]*>\n?/, '').replace(/\n?<\/subagent>\s*$/, '');
+      run.push(reportBlock(`subagent ${m.metadata?.agent ?? ''}${state}: ${m.description ?? ''}`.replace(/\s+/g, ' ').trim(), body));
     }
-    if (typeof text !== 'string' || !text.trim()) continue;
-    const role = m.type === 'user' ? 'user' : 'assistant';
-    turns.push(`<${role} t="${turns.length}">${text.trim()}</${role}>`);
   }
+  flush();
   return turns;
 }
+
+const safeText = (content) =>
+  (Array.isArray(content) ? content : [])
+    .map((c) => (c?.type === 'text' ? (c.text ?? '') : ''))
+    .join('\n');
 
 export function createOpenCodeSessionRecall(o) {
   const pinDir = o.pinDir ?? path.join(os.homedir(), '.pxpipe', 'opencode-session-pins');

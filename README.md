@@ -77,7 +77,8 @@ The data-stays-text filter (`keepSharp`) exists only on pxpipe's Anthropic path;
 ## Recall an earlier session (Claude Code + OpenCode, 2026-11-17)
 
 Open a new session in either client and type `recall` as the whole message.
-pxlite finds the latest earlier session of the same project, renders its turns as images (user prompts, `[Edit] path` lines and final answers; tool calls and results dropped) and attaches them to the first message.
+pxlite finds the latest earlier session of the same project, renders its turns as images (user prompts with a marker per pasted image; one line per tool call (file, command, pattern, skill or subagent task, see `tool-lines.mjs`), every assistant text, the first lines of failed calls and subagent reports; successful tool output and thinking dropped) and attaches them to the first message.
+The note above the images gives the transcript path and tells the model to answer from the images, and to search the transcript with `rg -uu -F` only for what they do not show or to confirm an exact value, never to read it whole.
 The model says which session it loaded and asks what to do next.
 
 - Sessions are interchangeable: a Claude Code session can load an OpenCode session of the same directory and vice versa; candidates of both sources are ranked by update time.
@@ -89,7 +90,7 @@ The model says which session it loaded and asks what to do next.
 - Runs for every model pxpipe images (config scope) and in every request shape: Anthropic Messages, Responses, and Chat Completions (`opencode/*`). Codex requests are excluded. Size bounds: `PXLITE_RECALL_SESSION_MAX_IMAGES` (12), `PXLITE_RECALL_MAX_CHARS` (200000).
 - The recall turn is answered from the images alone: `tools`, `tool_choice` and `parallel_tool_calls` are removed from that one request, so the model cannot open a transcript or DB instead of reading. The next request carries them again. `PXLITE_RECALL_KEEP_TOOLS=1` keeps them.
 - `pxlite status` reports `sessionRecall` (Claude Code context) and `openCodeSessionRecall` (OpenCode context); both count every injection, whichever client's session was loaded.
-- Collapsed history now drops tool calls and results too, and a compaction summary stays whole: see `patches/README.md`.
+- Collapsed history keeps one line per tool call, every assistant text, failures and subagent reports, and drops tool output; a compaction summary stays whole: see `patches/README.md`.
 
 ### Testing recall
 
@@ -102,7 +103,7 @@ Test sessions and any pin holding the password are deleted afterwards.
 `--wait` blocks until the proxy has been restarted with the current `pxlite.mjs`; without it the command warns when the running proxy is stale.
 
 The OpenCode API is read-only (no direct DB access). `PXLITE_OPENCODE_CLI` overrides the executable path.
-The OpenCode message API keeps at most the newest 600 messages; recall retains the latest compaction summary and the user/assistant text after it, omitting tool contents, reasoning and synthetic messages.
+The OpenCode message API keeps at most the newest 600 messages; recall retains the latest compaction summary and, after it, user text with attachment markers, assistant text, one line per tool call, failed-call errors and subagent results; tool output, reasoning and system notices are omitted.
 
 ## Undo
 

@@ -25,6 +25,26 @@ export const RECALL_INTRO =
   'treat it as superseded. Use it to remember what was done, decided and why; for exact values (numbers, paths, ids) re-read the source.]';
 export const RECALL_OUTRO = '[End of recalled turns.]';
 
+/** What the recall images hold: the same sentence for every recall path. */
+export const RECALL_CONTENT_NOTE =
+  'Each tool call is one line (file, command, pattern, skill or subagent task); tool output is not kept, except the first lines of a failure and subagent reports.';
+
+/**
+ * When to open the recalled session's source, and how. The images answer most questions, and
+ * a transcript is megabytes of JSONL whose lines can each be megabytes, so a model that reads
+ * it "to be safe" burns context for nothing; it may search it, never read it whole.
+ * @param {string|null} file  Claude Code transcript path, or null (OpenCode: no file)
+ */
+export function recallSourceNote(file) {
+  const when =
+    'Answer from the images first. Open the source only for something they do not show (a tool output, file contents, a cut text) or to confirm an exact value (id, path, number, password) before acting on it. ';
+  if (!file) return `${when}The source is an OpenCode session with no file on disk: ask the user before fetching it.`;
+  return (
+    when +
+    `Then search, never read it whole: rg -uu -F -m 5 "<exact text>" "${file}" | cut -c1-600 (JSONL, one entry per line, some lines are megabytes).`
+  );
+}
+
 const isRecallMessage = (it) => it?.role === 'user' && Array.isArray(it.content) && it.content[0]?.text === RECALL_INTRO;
 
 /**
@@ -81,8 +101,17 @@ export function itemsToTranscript(items, toTurns, { maxCallChars = 160, numbers 
   });
 }
 
-/** Keep the most recent turns that fit in `maxChars`, marking the cut. */
+/**
+ * Keep the most recent turns that fit in `maxChars`, marking the cut. A leading
+ * <earlier-summary> (Claude Code / OpenCode compaction summary) is always kept: it is the
+ * densest account of everything before the recalled turns, so it must not be the first
+ * thing cut from a long session.
+ */
 export function fitRecent(turnTexts, maxChars) {
+  if (turnTexts[0]?.startsWith('<earlier-summary>') && turnTexts.length > 1) {
+    const rest = fitRecent(turnTexts.slice(1), Math.max(0, maxChars - turnTexts[0].length - 2));
+    return `${turnTexts[0]}\n\n${rest}`;
+  }
   const kept = [];
   let n = 0;
   for (let i = turnTexts.length - 1; i >= 0; i--) {

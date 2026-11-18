@@ -157,7 +157,7 @@ test('claude recall: latest era only, no tool output or reminders, root-guarded,
   fs.rmSync(root, { recursive: true });
 });
 
-test('claude recall: reads, commands and lead-ins dropped; edits and final answers kept, all imaged', async () => {
+test('claude recall: one line per tool call and every assistant text kept, tool output and code dropped, all imaged', async () => {
   const { createClaudeRecall, CLAUDE_SUMMARY_MARKER } = await import('./recall-claude.mjs');
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pxlite-cc2-'));
   const file = path.join(root, 'ses.jsonl');
@@ -183,9 +183,10 @@ test('claude recall: reads, commands and lead-ins dropped; edits and final answe
   const c = (await r.apply(body)).messages[0].content;
   assert.equal(c[2].type, 'image', 'every turn is imaged');
   assert.ok(!c.some((b, i) => i > 1 && b.type === 'text' && /FINAL|SECOND ask/.test(b.text)), 'no turn stays as text');
-  for (const kept of [/OLD ask/, /FINAL answer one/, /SECOND ask/, /FINAL answer two/, /\[Edit\] src\/x\.py/, /\[Edit\] src\/y\.py/]) assert.match(imaged, kept);
+  for (const kept of [/OLD ask/, /LEADIN let me check/, /\[Read\] a\.py/, /\[Bash\] ls -la SECRETCMD/, /FINAL answer one/, /SECOND ask/, /FINAL answer two/, /\[Edit\] src\/x\.py/, /\[Edit\] src\/y\.py/]) assert.match(imaged, kept);
   assert.equal(imaged.match(/\[Edit\] src\/x\.py/g).length, 1, 'same file listed once');
-  for (const gone of [/LEADIN/, /a\.py/, /SECRETCMD/, /OLDCODE/, /NEWCODE/, /\[tool_use/, /\bOUT\b/]) assert.doesNotMatch(imaged, gone);
+  for (const gone of [/OLDCODE/, /NEWCODE/, /\[tool_use/, /\bOUT\b/]) assert.doesNotMatch(imaged, gone);
+  assert.ok(imaged.indexOf('LEADIN') < imaged.indexOf('[Read] a.py') && imaged.indexOf('[Edit] src/y.py') < imaged.indexOf('FINAL answer one'), 'calls and texts stay in order');
   assert.ok(imaged.indexOf('OLD ask') < imaged.indexOf('SECOND ask'), 'order kept');
   fs.rmSync(root, { recursive: true });
 });
@@ -354,7 +355,7 @@ test('history collapse over the byte budget is trimmed to fit, not skipped whole
   assert.ok(tight.r.info.collapsedTurns > 0 && tight.r.info.collapsedTurns < free.r.info.collapsedTurns);
 });
 
-test('history collapse drops tool calls and results, keeps edit paths and answers (patches/pxlite-vendor.patch)', async () => {
+test('history collapse keeps one line per tool call, every text, failures and subagent reports; drops tool output (patches/pxlite-vendor.patch)', async () => {
   const { messagesToHistorySegments } = await import(new URL('./vendor/pxpipe-proxy/dist/core/history.js', import.meta.url).href);
   const msgs = [
     { role: 'user', content: [{ type: 'text', text: 'please fix the parser' }] },
@@ -362,12 +363,17 @@ test('history collapse drops tool calls and results, keeps edit paths and answer
     { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'RESULT-SECRET line one' }] },
     { role: 'assistant', content: [{ type: 'text', text: 'LEADIN2 editing now' }, { type: 'tool_use', id: 't2', name: 'Edit', input: { file_path: 'src/a.py', old_string: 'OLD-BODY', new_string: 'NEW-BODY' } }] },
     { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't2', content: 'edited ok' }] },
+    { role: 'assistant', content: [{ type: 'tool_use', id: 't3', name: 'Bash', input: { command: 'pytest -q', description: 'Run tests' } }, { type: 'tool_use', id: 't4', name: 'Read', input: { file_path: 'src/a.py' } }] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't3', is_error: true, content: 'FAILED test_parse - KeyError' }, { type: 'tool_result', tool_use_id: 't4', content: 'RESULT-SECRET again' }] },
+    { role: 'assistant', content: [{ type: 'tool_use', id: 't5', name: 'Agent', input: { description: 'audit', subagent_type: 'Explore', prompt: 'check callers' } }, { type: 'tool_use', id: 't6', name: 'ToolSearch', input: { query: 'select:X' } }] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't5', content: [{ type: 'text', text: 'AGENT-REPORT two callers' }] }, { type: 'tool_result', tool_use_id: 't6', content: 'schema' }] },
     { role: 'assistant', content: [{ type: 'text', text: 'FINAL-ANSWER the parser is fixed' }] },
   ];
   const { text } = messagesToHistorySegments(msgs, msgs.length, 0);
-  assert.ok(text.includes('[Edit] src/a.py'));
-  assert.ok(text.includes('FINAL-ANSWER'));
-  for (const gone of ['LEADIN', 'RESULT-SECRET', 'OLD-BODY', 'NEW-BODY', 'tool_result', '[tool_use Read]', 'edited ok']) assert.ok(!text.includes(gone), `${gone} must not be rendered`);
+  for (const kept of ['LEADIN I will check', 'LEADIN2 editing now', '[Read] src/a.py', '[Edit] src/a.py', '[Bash] Run tests: pytest -q', '[Bash error] FAILED test_parse - KeyError',
+    '[Subagent Explore] audit: check callers', '[Message from subagent]\nAGENT-REPORT two callers', 'FINAL-ANSWER']) assert.ok(text.includes(kept), `${kept} must be rendered`);
+  assert.equal(text.split('[Read] src/a.py').length - 1, 1, 'a file read twice is listed once');
+  for (const gone of ['RESULT-SECRET', 'OLD-BODY', 'NEW-BODY', 'tool_result', '[tool_use', 'edited ok', 'ToolSearch', 'schema']) assert.ok(!text.includes(gone), `${gone} must not be rendered`);
 });
 
 test('a compaction summary in the first message stays whole after history collapse (patches/pxlite-vendor.patch)', async () => {
@@ -440,4 +446,43 @@ test('session recall: picks by name/id, pins the choice, attaches before the com
   assert.equal(await sr.apply(req('please recall the plan'), hdr), null);
   assert.equal(await sr.apply({ ...req('recall'), metadata: {} }, new Headers()), null);
   assert.equal(pickSession([], 'x'), null);
+});
+
+test('claudeTurnsOf keeps images, subagents, skills, errors and notifications', async () => {
+  const { claudeTurnsOf } = await import('./recall-claude.mjs');
+  const u = (content, extra = {}) => ({ type: 'user', message: { role: 'user', content }, ...extra });
+  const a = (content) => ({ type: 'assistant', message: { role: 'assistant', content } });
+  const report = 'Some frame text. The report follows:\n  **REPORT-BODY** line one\n  line two';
+  const turns = claudeTurnsOf([
+    u([{ type: 'image', source: {} }, { type: 'text', text: 'see screenshot' }]),
+    u('[Image: source: C:\\tmp\\shot.png]', { isMeta: true }),
+    u('SKILL-BODY-TEXT', { isMeta: true }),
+    a([{ type: 'tool_use', id: 's1', name: 'Skill', input: { skill: 'workflow', args: 'spec' } }]),
+    a([{ type: 'tool_use', id: 'a1', name: 'Agent', input: { description: 'map pricing', subagent_type: 'Explore', prompt: 'look', run_in_background: true } }]),
+    u([{ type: 'tool_result', tool_use_id: 'a1', content: 'Async agent launched successfully' }]),
+    a([{ type: 'tool_use', id: 'b1', name: 'Bash', input: { command: 'bun test', description: 'Run tests' } }]),
+    u([{ type: 'tool_result', tool_use_id: 'b1', is_error: true, content: 'ERROR-LINE: 2 failed' }]),
+    a([{ type: 'tool_use', id: 'b2', name: 'Bash', input: { command: 'ls' } }]),
+    u([{ type: 'tool_result', tool_use_id: 'b2', content: 'OK-OUTPUT' }]),
+    u('x', { isMeta: true, origin: { kind: 'peer', name: 'Explore', body: report } }),
+    u('<task-notification><status>completed</status><summary>Agent map pricing done</summary></task-notification>', { origin: { kind: 'task-notification' } }),
+    u('The coordinator sent a message: COORD-NOTE', { isMeta: true, origin: { kind: 'coordinator' } }),
+    u('y', { isMeta: true, origin: { kind: 'peer', name: 'Plan', handback: true, handbackReportText: 'CLEAN-REPORT' } }),
+    { ...a([{ type: 'text', text: 'SIDECHAIN-INNER' }]), isSidechain: true },
+    a([{ type: 'text', text: 'done' }]),
+  ]);
+  const all = turns.join('\n');
+  for (const kept of [/\[image\]\nsee screenshot\n\[Image: source: C:\\tmp\\shot\.png\]\n<\/user>/, /\[Skill\] workflow spec/, /\[Subagent Explore, background\] map pricing: look/,
+    /\[Bash\] Run tests: bun test/, /\[Bash error\] ERROR-LINE: 2 failed/, /\[Message from Explore\]\n\*\*REPORT-BODY\*\* line one\nline two/, /\[Task notification\] completed — Agent map pricing done/, /\[Message from coordinator\]\nThe coordinator sent a message: COORD-NOTE/, /\[Message from Plan\]\nCLEAN-REPORT/]) assert.match(all, kept);
+  for (const gone of [/SKILL-BODY-TEXT/, /OK-OUTPUT/, /Async agent launched/, /SIDECHAIN-INNER/, /The report follows/]) assert.doesNotMatch(all, gone);
+  assert.equal(turns.filter((t) => t.startsWith('<user ')).length, 1, 'tool results and harness notes are not user turns');
+});
+
+test('fitRecent keeps a leading compaction summary and cuts turns instead', async () => {
+  const { fitRecent } = await import('./recall.mjs');
+  const sum = `<earlier-summary>\n${'s'.repeat(80)}\n</earlier-summary>`;
+  const out = fitRecent([sum, 'a'.repeat(50), 'b'.repeat(50), 'c'.repeat(50)], sum.length + 60);
+  assert.ok(out.startsWith(sum));
+  assert.match(out, /\[… 2 earlier turn\(s\) not shown …\]/);
+  assert.ok(out.endsWith('c'.repeat(50)));
 });

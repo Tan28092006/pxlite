@@ -13,6 +13,8 @@
 import { DENSE_CONTENT_CHARS_PER_IMAGE, DENSE_CONTENT_COLS, maxCharsPerImage, DENSE_RENDER_STYLE, MAX_HEIGHT_PX, neutralizeSentinel, reflow, renderTextToPngsWithCharLimit, roleSlotSegment, SLOT_MARK_ASSISTANT, SLOT_MARK_USER } from './render.js';
 import { factSheetText } from './factsheet.js';
 import { bytesToBase64 } from './png.js';
+// PXLITE PATCH: one-line tool calls shared with recall (pxlite/tool-lines.mjs, four levels up).
+import { SUBAGENT_TOOL_NAMES, errorLine, isLaunchAck, reportBlock, toolCallLines } from '../../../../tool-lines.mjs';
 /**
  * Banner text blocks that bracket the collapsed-history image(s) in the synthetic
  * user message. Exported as the SINGLE SOURCE OF TRUTH: transform.ts keys its
@@ -143,7 +145,6 @@ export function staleFreshnessHints(text) {
  *  and tool results, keep one "[Edit] path" line per file edit and every assistant message
  *  that carries no tool call (the answers). Off with PXLITE_HISTORY_KEEP_TOOLS=1. */
 const HISTORY_DROP_TOOLS = !/^(1|true|yes|on)$/i.test(process.env.PXLITE_HISTORY_KEEP_TOOLS ?? '');
-const HISTORY_EDIT_TOOLS = new Set(['Edit', 'Write', 'NotebookEdit', 'MultiEdit']);
 export function blocksToText(content, opts) {
     if (typeof content === 'string')
         return content;
@@ -154,25 +155,21 @@ export function blocksToText(content, opts) {
         return '';
     const parts = [];
     const dropTools = opts?.dropTools === true;
-    // A lead-in sentence ("I will check ...") that rides with a tool call is noise later;
-    // the message that carries the answer has no tool call and keeps its text.
-    const leadIn = dropTools && content.some((b) => b && typeof b === 'object' && b.type === 'tool_use');
+    // PXLITE PATCH (2026-11-18): with dropTools, every assistant text is kept (lead-ins carry
+    // the reasons for a change of course), each tool call becomes one line (tool-lines.mjs),
+    // and of the tool output only failures and subagent reports survive.
     for (const blk of content) {
         if (!blk || typeof blk !== 'object')
             continue;
         const t = blk.type;
         switch (t) {
             case 'text':
-                if (leadIn)
-                    break;
                 parts.push(blk.text);
                 break;
             case 'tool_use': {
                 const tu = blk;
                 if (dropTools) {
-                    const file = tu.input?.file_path ?? tu.input?.notebook_path;
-                    if (HISTORY_EDIT_TOOLS.has(tu.name) && typeof file === 'string')
-                        parts.push(`[${tu.name}] ${file}`);
+                    parts.push(...toolCallLines(tu.name, tu.input, { seen: opts?.seen }));
                     break;
                 }
                 // Compact JSON (no indent) — pretty-printing bloats text ~5× and the renderer is row-aware.
@@ -187,8 +184,6 @@ export function blocksToText(content, opts) {
                 break;
             }
             case 'tool_result': {
-                if (dropTools)
-                    break;
                 const tr = blk;
                 const inner = tr.content;
                 let innerText;
@@ -211,6 +206,14 @@ export function blocksToText(content, opts) {
                 }
                 else {
                     innerText = '';
+                }
+                if (dropTools) {
+                    const name = opts?.callNames?.get(tr.tool_use_id) ?? 'tool';
+                    if (tr.is_error === true)
+                        parts.push(errorLine(name, innerText));
+                    else if (SUBAGENT_TOOL_NAMES.has(name) && innerText.trim() && !isLaunchAck(innerText))
+                        parts.push(reportBlock('subagent', innerText));
+                    break;
                 }
                 const errMark = tr.is_error === true ? ' (error)' : '';
                 parts.push(`[tool_result${errMark}]\n${staleFreshnessHints(innerText)}`);
@@ -256,12 +259,22 @@ export function messagesToHistoryText(messages, upToExclusive, fromInclusive = 0
 export function messagesToHistorySegments(messages, upToExclusive, fromInclusive = 0) {
     const textOut = [];
     const slotOut = [];
+    // PXLITE PATCH: tool names by call id (a result names its call only by id) and the files
+    // already listed, so a file read or edited many times shows once.
+    const callNames = new Map();
+    for (let i = 0; i < upToExclusive; i++) {
+        for (const b of Array.isArray(messages[i]?.content) ? messages[i].content : []) {
+            if (b && b.type === 'tool_use' && typeof b.id === 'string')
+                callNames.set(b.id, b.name);
+        }
+    }
+    const seen = new Set();
     for (let i = fromInclusive; i < upToExclusive; i++) {
         const m = messages[i];
         // The user's typed words are carried as TEXT alongside the image (see
         // userTurnBlocks) and are deliberately not rasterized. Everything else in the
         // message — tool_results, system-reminders, slab scaffolding — still renders.
-        const body = blocksToText(m.role === 'user' ? withoutTypedUserText(m.content) : m.content, { dropTools: HISTORY_DROP_TOOLS });
+        const body = blocksToText(m.role === 'user' ? withoutTypedUserText(m.content) : m.content, { dropTools: HISTORY_DROP_TOOLS, callNames, seen });
         if (!body.trim())
             continue;
         const isAssistant = m.role === 'assistant';

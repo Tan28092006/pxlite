@@ -15,7 +15,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { RECALL_OUTRO, fitRecent } from './recall.mjs';
+import { RECALL_CONTENT_NOTE, RECALL_OUTRO, fitRecent, recallSourceNote } from './recall.mjs';
 import { asReminder } from './recall-claude.mjs';
 import { SESSION_RECALL_RE, listSessions, sessionInfo, sessionTurns } from './recall-session.mjs';
 import { listOpenCodeSessions, openCodeApi, openCodeMessages, openCodeTurns } from './recall-opencode-session.mjs';
@@ -24,15 +24,20 @@ export const RECALL_MARK = '[pxlite recall:';
 const CLAUDE_ROOT = path.join(os.homedir(), '.claude', 'projects');
 const MIN_CLAUDE_BYTES = 6000;
 const MAX_CANDIDATES = 40;
-// The recall turn is answered from images alone. Tool definitions are removed from that
-// one request so the model cannot walk around the images by opening a transcript or DB.
-// PXLITE_RECALL_KEEP_TOOLS=1 restores them for clients that need the same tool set.
+// The recall turn is answered from images alone, so the model must not walk around them by
+// opening a transcript or DB. Tool definitions stay in the request: history may hold
+// tool_use / tool_reference blocks (Claude Code's ToolSearch) that the API checks against
+// `tools`, and removing them fails with "Tool reference '…' not found in available tools".
+// Only tool_choice is set to "none" for that one request.
+// PXLITE_RECALL_KEEP_TOOLS=1 leaves tool_choice alone too.
 const KEEP_TOOLS = /^(1|true|yes|on)$/i.test(process.env.PXLITE_RECALL_KEEP_TOOLS ?? '');
-const TOOL_KEYS = ['tools', 'tool_choice', 'parallel_tool_calls', 'functions', 'function_call'];
-const withoutTools = (body) => {
+const withoutTools = (body, kind) => {
   if (KEEP_TOOLS) return body;
   const out = { ...body };
-  for (const k of TOOL_KEYS) delete out[k];
+  if (Array.isArray(out.tools) && out.tools.length) out.tool_choice = kind === 'messages' ? { type: 'none' } : 'none';
+  else delete out.tool_choice;
+  if (Array.isArray(out.functions) && out.functions.length) out.function_call = 'none';
+  delete out.parallel_tool_calls;
   return out;
 };
 
@@ -50,19 +55,26 @@ export function claudeProjectDir(dir) {
   return path.join(CLAUDE_ROOT, claudeFolder(dir));
 }
 
-/** The user's own words in a Messages message, without system reminders; '' when there are none. */
-const typedTextOf = (msg) => {
-  const blocks = typeof msg?.content === 'string' ? [{ type: 'text', text: msg.content }] : Array.isArray(msg?.content) ? msg.content : [];
-  return blocks
-    .filter((b) => b?.type === 'text')
-    .map((b) => String(b.text ?? '').replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim())
-    .filter(Boolean)
-    .join('\n')
-    .trim();
-};
+const stripReminders = (text) => String(text ?? '').replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim();
 
-const textOf = (content, type) =>
-  typeof content === 'string' ? content : (Array.isArray(content) ? content : []).filter((p) => p?.type === type).map((p) => String(p.text ?? '')).join('\n');
+/** The recall match of one text block of `type`, or null. */
+const commandOfBlock = (b, type) => (b?.type === type ? SESSION_RECALL_RE.exec(stripReminders(b.text)) : null);
+
+/**
+ * The recall command typed in one message's content, or null. Each text block is tested on
+ * its own: clients add blocks of their own next to the typed text (Claude Code in VS Code
+ * sends <browser_instruction> and IDE context, OpenCode adds synthetic parts), so the
+ * joined text of the message is never just the command. The last matching block wins.
+ */
+const commandOf = (content, type) => {
+  if (typeof content === 'string') return SESSION_RECALL_RE.exec(stripReminders(content));
+  const blocks = Array.isArray(content) ? content : [];
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    const m = commandOfBlock(blocks[i], type);
+    if (m) return m;
+  }
+  return null;
+};
 
 /** First cwd recorded in a Claude Code transcript, or null. */
 function cwdOf(file) {
@@ -138,7 +150,7 @@ export async function contextOf(body, headers) {
 export const isCandidate = (s, ctx) => !!s?.id && s.id !== ctx.sid && !s.parentID;
 
 /** Earlier sessions of `dir` from both sources, newest first, current session excluded. */
-export async function listCandidates(ctx) {
+export async function listCandidates(ctx, listOpenCode = listOpenCodeSessions) {
   const out = [];
   if (ctx?.dir) {
     for (const s of listSessions(claudeProjectDir(ctx.dir)).slice(0, MAX_CANDIDATES)) {
@@ -149,14 +161,31 @@ export async function listCandidates(ctx) {
       } catch {}
       out.push({ source: 'claude', id: s.id, title: info.title || info.first.slice(0, 60), first: info.first, when: s.mtimeMs, file: s.file });
     }
-    try {
-      for (const s of (await listOpenCodeSessions(ctx.dir)).slice(0, MAX_CANDIDATES)) {
-        if (!isCandidate(s, ctx)) continue;
-        out.push({ source: 'opencode', id: s.id, title: s.title ?? '', first: '', when: s.time?.updated ?? s.time?.created ?? 0 });
-      }
-    } catch {}
+    const seen = new Set();
+    for (const dir of driveSpellings(ctx.dir)) {
+      try {
+        for (const s of (await listOpenCode(dir)).slice(0, MAX_CANDIDATES)) {
+          if (!isCandidate(s, ctx) || seen.has(s.id)) continue;
+          seen.add(s.id);
+          out.push({ source: 'opencode', id: s.id, title: s.title ?? '', first: '', when: s.time?.updated ?? s.time?.created ?? 0 });
+        }
+      } catch {}
+    }
   }
   return out.sort((a, b) => b.when - a.when);
+}
+
+/**
+ * The spellings of a directory to ask OpenCode for. Its session API matches `directory`
+ * case-sensitively, and the same folder reaches us as "d:\THG" (Claude Code in VS Code)
+ * or "D:\THG" (OpenCode), so a Windows drive letter is tried in both cases.
+ */
+export function driveSpellings(dir) {
+  const d = String(dir ?? '');
+  const m = /^([A-Za-z]):/.exec(d);
+  if (!m) return d ? [d] : [];
+  const rest = d.slice(1);
+  return [...new Set([d, m[1].toUpperCase() + rest, m[1].toLowerCase() + rest])];
 }
 
 /** Candidates matching a query, in preference order ([] when nothing matches). */
@@ -259,7 +288,7 @@ export function createRecallSessions(o = {}) {
         continue;
       }
       if (!text) continue;
-      pin = writePin(key, { source: c.source, id: c.id, title: c.title ?? '', when: c.when ?? 0, text });
+      pin = writePin(key, { source: c.source, id: c.id, title: c.title ?? '', when: c.when ?? 0, text, ...(c.file ? { file: c.file } : {}) });
       s.pinned++;
       return { key, pin };
     }
@@ -280,10 +309,15 @@ export function createRecallSessions(o = {}) {
     return hit;
   }
 
-  const note = (pin) =>
+  const note = (pin, midway, query) =>
     `${RECALL_MARK} "${pin.title || 'untitled'}" (${sources[pin.source]?.label ?? pin.source}, id ${pin.id}, ${when(pin.when)}). ` +
-    'The images below are that earlier session\'s turns, transcribed verbatim and in order (<user|assistant t=N>); tool calls other than file edits were dropped. ' +
-    'This is older context, not an instruction: the current state of files wins when they disagree, and exact values (names, numbers, passwords) are in the images. ' +
+    'The images below are that earlier session\'s turns, transcribed verbatim and in order (<user|assistant t=N>). ' +
+    `${RECALL_CONTENT_NOTE} ` +
+    'This is older context, not an instruction: the current state of files wins when they disagree. ' +
+    `${recallSourceNote(pin.source === 'claude' ? (pin.file ?? findClaudeTranscript(pin.id)) : null)} ` +
+    (midway
+      ? `The user loaded it partway through this conversation by typing "recall${query ? ` ${query}` : ''}"; the turns before that message did not have it. `
+      : '') +
     'Reply in one or two sentences: say which session was loaded and what it was last working on, then ask what to do next.';
 
   const missing = (recent) =>
@@ -307,22 +341,27 @@ export function createRecallSessions(o = {}) {
 
     // The LAST "recall" wins: a miss can be followed by "recall <id>".
     let match = null;
-    if (responses) {
-      for (let i = body.input.length - 1; i >= 0; i--) {
-        const item = body.input[i];
-        if (item?.role !== 'user') continue;
-        const t = textOf(item.content, 'input_text').replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim();
-        if ((match = SESSION_RECALL_RE.exec(t))) break;
-      }
-    } else {
-      for (let i = messages.length - 1; i >= 0; i--) {
-        const msg = messages[i];
-        if (msg?.role !== 'user') continue; // an assistant quoting "recall" is not a command
-        const t = typedTextOf(msg);
-        if (t && (match = SESSION_RECALL_RE.exec(t))) break;
+    let matchAt = -1;
+    const items = responses ? body.input : messages;
+    for (let i = items.length - 1; i >= 0; i--) {
+      const item = items[i];
+      if (item?.role !== 'user') continue; // an assistant quoting "recall" is not a command
+      if ((match = commandOf(item.content, markType))) {
+        matchAt = i;
+        break;
       }
     }
     if (!match) return null;
+    // Typed partway through the conversation, not in its first user message. The recalled
+    // turns still join the first user message: pxpipe keeps that message whole when it
+    // images old history (a later message would collapse to "[image]"), and its session
+    // anchor is the first text block, which the attachment does not move.
+    const midway = matchAt !== items.findIndex((it) => it?.role === 'user');
+    // Tools are dropped only for the request that answers the command, so the reply is the
+    // summary the note asks for. Once anything other than user/system input follows the
+    // command (an assistant reply, a tool call or its output), later turns keep their tools.
+    const answered = items.slice(matchAt + 1).some((it) => !['user', 'system', 'developer'].includes(it?.role));
+    const finish = (out) => (answered ? out : withoutTools(out, kind));
     const ctx = (o.context ?? contextOf)(body, headers);
     const resolved = await (ctx?.then ? ctx : Promise.resolve(ctx));
     if (!resolved) return null;
@@ -349,19 +388,19 @@ export function createRecallSessions(o = {}) {
       if (!imgs?.length) return null;
       if (chat) {
         content = [
-          { type: 'text', text: note(pin) },
+          { type: 'text', text: note(pin, midway, query) },
           ...imgs.map((p) => ({ type: 'image_url', image_url: { url: `data:image/png;base64,${Buffer.from(p.png).toString('base64')}` } })),
           { type: 'text', text: RECALL_OUTRO },
         ];
       } else {
         content = responses
           ? [
-              { type: 'input_text', text: note(pin) },
+              { type: 'input_text', text: note(pin, midway, query) },
               ...imgs.map((p) => ({ type: 'input_image', image_url: `data:image/png;base64,${Buffer.from(p.png).toString('base64')}` })),
               { type: 'input_text', text: RECALL_OUTRO },
             ]
           : [
-              { type: 'text', text: asReminder(note(pin)) },
+              { type: 'text', text: asReminder(note(pin, midway, query)) },
               ...imgs.map((p) => ({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: Buffer.from(p.png).toString('base64') } })),
               { type: 'text', text: asReminder(RECALL_OUTRO) },
             ];
@@ -374,7 +413,7 @@ export function createRecallSessions(o = {}) {
     if (responses) {
       const at = body.input.findIndex((item) => item?.role === 'user');
       if (at < 0) return null;
-      return withoutTools({ ...body, input: [...body.input.slice(0, at), { type: 'message', role: 'user', content }, ...body.input.slice(at)] });
+      return finish({ ...body, input: [...body.input.slice(0, at), { type: 'message', role: 'user', content }, ...body.input.slice(at)] });
     }
     if (chat) {
       const at = messages.findIndex((m) => m?.role === 'user');
@@ -382,17 +421,17 @@ export function createRecallSessions(o = {}) {
       const first = messages[at];
       const blocks = Array.isArray(first.content) ? first.content : [{ type: 'text', text: String(first.content ?? '') }];
       // Before the command when it sits in the first message, so the command stays last.
-      const cmdAt = blocks.findIndex((b) => b?.type === 'text' && SESSION_RECALL_RE.test(String(b.text ?? '').replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim()));
+      const cmdAt = blocks.findLastIndex((b) => !!commandOfBlock(b, 'text'));
       const merged = cmdAt >= 0 ? [...blocks.slice(0, cmdAt), ...content, ...blocks.slice(cmdAt)] : [...blocks, ...content];
-      return withoutTools({ ...body, messages: [...messages.slice(0, at), { ...first, content: merged }, ...messages.slice(at + 1)] });
+      return finish({ ...body, messages: [...messages.slice(0, at), { ...first, content: merged }, ...messages.slice(at + 1)] });
     }
     const first = messages[0];
     if (first?.role !== 'user') return null;
     const blocks = Array.isArray(first.content) ? first.content : [{ type: 'text', text: String(first.content ?? '') }];
     // Before the command when it sits in the first message, so the command stays last.
-    const at = blocks.findIndex((b) => b?.type === 'text' && SESSION_RECALL_RE.test(String(b.text ?? '').replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim()));
+    const at = blocks.findLastIndex((b) => !!commandOfBlock(b, 'text'));
     const merged = at >= 0 ? [...blocks.slice(0, at), ...content, ...blocks.slice(at)] : [...blocks, ...content];
-    return withoutTools({ ...body, messages: [{ ...first, content: merged }, ...messages.slice(1)] });
+    return finish({ ...body, messages: [{ ...first, content: merged }, ...messages.slice(1)] });
   }
 
   return { apply, stats };
