@@ -15,6 +15,6 @@
   },
   "scripts": {
     "postinstall": "node scripts/postinstall.mjs",
-    "test": "node --test test.mjs test-recall-sessions.mjs test-opencode-session.mjs test-serve.mjs"
+    "test": "node --test test.mjs test-recall-sessions.mjs test-opencode-session.mjs test-serve.mjs test-cost-report.mjs"
   }
 }
