@@ -321,7 +321,7 @@ async function writeWebResponse(res, out) {
 
 // Labels for a Claude Messages request in events.jsonl, so cost reports can split
 // tokens by session and body kind. Ids and labels only, never prompt text.
-// session_id: header x-claude-code-session-id, else metadata.user_id JSON .session_id.
+// OpenCode's session header wins over the process-wide Claude auth plugin UUID.
 // agent_role: Claude Code sends x-claude-code-agent-id only on subagent requests
 // (measured 2026-11-18, claude-cli 2.1.310: every subagent turn had it, no main-loop
 // request did). Without the session header the client is not Claude Code: unknown.
@@ -333,14 +333,17 @@ const DELTA_SYSTEM_MAX = 2000;
 // from the headers, body_kind is left out.
 function claudeRequestTags(body, headers) {
   const tags = {};
-  let sid = headers.get('x-claude-code-session-id');
+  const openCodeSid = headers.get('x-opencode-session-id');
+  let sid = openCodeSid || headers.get('x-claude-code-session-id');
   if (!sid) {
     try {
       sid = JSON.parse(body?.metadata?.user_id ?? '{}')?.session_id;
     } catch {}
   }
   if (typeof sid === 'string' && sid) tags.session_id = sid;
-  tags.agent_role = headers.get('x-claude-code-agent-id') ? 'subagent' : headers.get('x-claude-code-session-id') ? 'main' : 'unknown';
+  tags.agent_role = openCodeSid
+    ? (headers.get('x-opencode-parent-session-id') ? 'subagent' : 'main')
+    : headers.get('x-claude-code-agent-id') ? 'subagent' : headers.get('x-claude-code-session-id') ? 'main' : 'unknown';
   if (!body || typeof body !== 'object') return tags;
   const sys = typeof body?.system === 'string' ? [{ text: body.system }] : Array.isArray(body?.system) ? body.system : [];
   const sysChars = sys.reduce((n, b) => (typeof b?.text !== 'string' || b.text.startsWith(BILLING_LINE) ? n : n + b.text.length), 0);
