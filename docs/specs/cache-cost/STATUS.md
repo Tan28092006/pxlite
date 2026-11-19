@@ -16,7 +16,7 @@ Cập nhật: 2026-11-18T16:00+07:00
 | T3 | Đặt dấu cache để ảnh lịch sử giống hệt được đọc lại | trunk | T1 | done | 7345c60; tasks/T3/qa-report.md (pass; DONE3 chờ log sau restart) |
 | T5 | Bỏ trùng khối chèn lặp | leaf | T1 | done | QA pass; F4 sửa (skip theo Node); F1 request phụ có thể nhận marker, F3 thẻ lồng trong system-reminder vẫn bị thay — rủi ro thấp, theo dõi |
 | T4 | Mô phỏng lời lỗ cache 1 giờ | leaf | T2 | done | 6857a9b; QA pass; F1 sửa: in thêm cận "delta giữ ấm". DONE4 chờ log ≥ 1 ngày: chạy lại `--ttl-sim` sau 2026-11-19T09:04Z |
-| T6 | Bật cache 1 giờ cho phần đầu ổn định | trunk | T4 | blocked | chờ DONE4; chỉ làm nếu 1h có lời ở cả hai cận, và hỏi user trước |
+| T6 | Bật cache 1 giờ cho phần đầu ổn định | trunk | T4 | dropped | 1h đắt hơn 22,1% (+563.320 / +658.584 theo hai cận); xem SPEC `## Quyết định` 2026-11-19 |
 
 ## Chờ user
 
@@ -24,8 +24,8 @@ Cập nhật: 2026-11-18T16:00+07:00
 
 ## Việc tiếp theo
 
-- T1–T5 xong. Chạy lại `node scripts/cost-report.mjs --ttl-sim` khi log ≥ 1 ngày (sau 2026-11-19T09:04Z, tức 16:04 giờ +07), ghi kết luận vào `## Quyết định` của SPEC, rồi hỏi user về T6 (làm hoặc dropped).
-- Mẫu hiện tại (chưa đủ 1 ngày): cache 1 giờ đắt hơn 21.4% toàn log; phiên OpenCode `ses_e108…` đắt hơn 39.5% (17 request). Nghiêng về bỏ T6.
+- T1–T5 xong, T4 chốt, T6 dropped. Không còn task mở.
+- T4 chốt sớm theo user khi log chưa đủ 1 ngày: cache 1 giờ đắt hơn 22,1% toàn log; phiên OpenCode `ses_e108…` đắt hơn 39,5% (17 request). Chạy lại `--ttl-sim` nếu thói quen dùng đổi.
 
 ## Kiểm tra cho OpenCode (2026-11-19)
 
