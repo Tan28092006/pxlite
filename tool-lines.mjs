@@ -10,6 +10,7 @@
 export const MAX_CALL_CHARS = 200;
 export const MAX_ERROR_CHARS = 600;
 export const MAX_REPORT_CHARS = 6000;
+export const MAX_MESSAGE_CHARS = 800;
 
 /** Keep head and tail of an over-long string, marking the cut. */
 export function clip(text, max) {
@@ -79,6 +80,11 @@ export function toolCallLines(name, input, { seen, max = MAX_CALL_CHARS } = {}) 
     case 'webfetch':
     case 'websearch':
       return [`[${n}] ${oneLine(i.url ?? i.query ?? '', max)}`];
+    case 'SendMessage': {
+      const body = typeof i.message === 'string' ? i.message : safeJson(i.message);
+      const head = [i.to && `to ${i.to}`, i.summary].filter(Boolean).join(': ');
+      return [`[SendMessage${head ? ` ${oneLine(head, max)}` : ''}] ${oneLine(body, Math.max(max, MAX_MESSAGE_CHARS))}`];
+    }
     default:
       if (SUBAGENT_TOOL_NAMES.has(n)) {
         const kind = i.subagent_type ?? i.agent;

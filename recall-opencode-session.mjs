@@ -106,6 +106,19 @@ export function openCodeTurns(messages) {
   return turns;
 }
 
+const MAX_NESTED_DEPTH = 2;
+const NESTED_RECALL_RE = /^[ \t]*recall[ \t]+([^\n]{1,80}?)[ \t]*$/gim;
+
+/** Queries of `recall <id|title>` lines the user typed in a session (user text only, bare `recall` skipped). */
+export function nestedRecallQueries(messages) {
+  const out = [];
+  for (const m of messages) {
+    if (m?.type !== 'user' || typeof m.text !== 'string') continue;
+    for (const hit of m.text.matchAll(NESTED_RECALL_RE)) if (!out.includes(hit[1])) out.push(hit[1]);
+  }
+  return out;
+}
+
 const safeText = (content) =>
   (Array.isArray(content) ? content : [])
     .map((c) => (c?.type === 'text' ? (c.text ?? '') : ''))
@@ -150,7 +163,26 @@ export function createOpenCodeSessionRecall(o) {
         const pos = input.findIndex((item) => item.role === 'user');
         return { ...body, input: [...input.slice(0, pos), notice, ...input.slice(pos)] };
       }
-      const turns = openCodeTurns(await messages(selected.id));
+      const sessions = await list(sid);
+      const visited = new Set([sid, selected.id]);
+      const expand = async (s, depth) => {
+        const msgs = await messages(s.id);
+        const own = openCodeTurns(msgs);
+        if (depth >= MAX_NESTED_DEPTH) return own;
+        const nested = [];
+        for (const q of nestedRecallQueries(msgs)) {
+          const target = selectOpenCodeSession(sessions, s.id, q);
+          if (!target || visited.has(target.id)) continue;
+          visited.add(target.id);
+          try {
+            const inner = await expand(target, depth + 1);
+            if (inner.length) nested.push(`<recalled-session id="${target.id}" title="${String(target.title ?? '').replace(/"/g, "'")}" via="recall ${q}">\n${fitRecent(inner, Math.floor(maxChars / 4))}\n</recalled-session>`);
+          } catch { stats.failed++; }
+        }
+        // Earlier sessions that this one recalled come first (older context); its own turns after.
+        return own[0]?.startsWith('<earlier-summary>') ? [own[0], ...nested, ...own.slice(1)] : [...nested, ...own];
+      };
+      const turns = await expand(selected, 0);
       if (!turns.length) return null;
       pin = { id: selected.id, title: selected.title ?? '', transcript: fitRecent(turns, maxChars) };
       fs.mkdirSync(pinDir, { recursive: true });

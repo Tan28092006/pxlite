@@ -147,6 +147,20 @@ export function sessionTurns(buf) {
   return summaryText ? [`<earlier-summary>\n${summaryText}\n</earlier-summary>`, ...turns] : turns;
 }
 
+const MAX_NESTED_DEPTH = 2;
+const NESTED_RECALL_RE = /^[ \t]*recall[ \t]+([^\n]{1,80}?)[ \t]*$/gim;
+const sessionIdOfFile = (file) => path.basename(file, '.jsonl');
+
+/** Queries of `recall <id|title>` lines the user typed in a session (typed text only; bare `recall` skipped). */
+export function nestedRecallQueries(buf) {
+  const out = [];
+  for (const e of parseLines(buf, false)) {
+    if (e.type !== 'user' || e.isMeta || e.isSidechain || !e.message) continue;
+    for (const hit of typedText(e.message).matchAll(NESTED_RECALL_RE)) if (!out.includes(hit[1])) out.push(hit[1]);
+  }
+  return out;
+}
+
 export function createSessionRecall(o) {
   const root = path.resolve(o.root ?? path.join(os.homedir(), '.claude', 'projects'));
   const pinFile = o.pinFile ?? path.join(os.homedir(), '.pxpipe', 'recall-pins.json');
@@ -212,10 +226,27 @@ export function createSessionRecall(o) {
   async function build(pin, model, key) {
     const ck = `${key}:${model}`;
     if (images.has(ck)) return images.get(ck);
-    const cap = 120 * 1024 * 1024;
-    const start = Math.max(0, pin.bytes - cap);
-    const text = readSlice(pin.file, start, pin.bytes - start);
-    const turns = sessionTurns(start > 0 ? text.slice(text.indexOf('\n') + 1) : text);
+    const visited = new Set([pin.id, sessionIdOfFile(pin.file)]);
+    const expand = (file, bytes, selfId, depth) => {
+      const cap = 120 * 1024 * 1024;
+      const start = Math.max(0, bytes - cap);
+      const text = readSlice(file, start, bytes - start);
+      const buf = start > 0 ? text.slice(text.indexOf('\n') + 1) : text;
+      const own = sessionTurns(buf);
+      if (depth >= MAX_NESTED_DEPTH) return own;
+      const nested = [];
+      for (const q of nestedRecallQueries(buf)) {
+        const hit = resolve(selfId, q);
+        if (hit.none || visited.has(hit.id)) continue;
+        visited.add(hit.id);
+        try {
+          const inner = expand(hit.file, hit.bytes, hit.id, depth + 1);
+          if (inner.length) nested.push(`<recalled-session id="${hit.id}" title="${String(hit.title ?? '').replace(/"/g, "'")}" via="recall ${q}">\n${fitRecent(inner, Math.floor(maxChars / 4))}\n</recalled-session>`);
+        } catch { stats.failed++; }
+      }
+      return own[0]?.startsWith('<earlier-summary>') ? [own[0], ...nested, ...own.slice(1)] : [...nested, ...own];
+    };
+    const turns = expand(pin.file, pin.bytes, sessionIdOfFile(pin.file), 0);
     if (!turns.length) return null;
     const pages = (await o.render(fitRecent(turns, maxChars), model)).slice(-maxImages);
     const blocks = pages.map((p) => ({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: Buffer.from(p.png).toString('base64') } }));

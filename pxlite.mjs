@@ -395,14 +395,14 @@ async function serve() {
       toTurns: responsesItemsToTurns,
       render: async (text, model) => (await renderTextToImages(text, { model, reflow: true })).pages,
       imageDetail: openAIImageDetail,
-      maxChars: Number(process.env.PXLITE_RECALL_MAX_CHARS ?? 200_000),
-      maxImages: Number(process.env.PXLITE_RECALL_MAX_IMAGES ?? 24),
+      maxChars: Number(process.env.PXLITE_RECALL_MAX_CHARS ?? 800_000),
+      maxImages: Number(process.env.PXLITE_RECALL_MAX_IMAGES ?? 50),
     });
     stats.recall = r.stats;
     const cr = createClaudeRecall({
       render: async (text, model) => (await renderTextToImages(text, { model, reflow: true })).pages,
-      maxChars: Number(process.env.PXLITE_RECALL_MAX_CHARS ?? 200_000),
-      maxImages: Number(process.env.PXLITE_RECALL_CLAUDE_MAX_IMAGES ?? 12),
+      maxChars: Number(process.env.PXLITE_RECALL_MAX_CHARS ?? 800_000),
+      maxImages: Number(process.env.PXLITE_RECALL_CLAUDE_MAX_IMAGES ?? 50),
     });
     stats.claudeRecall = cr.stats;
     // Recall only for models pxpipe itself images (config.json / PXPIPE_MODELS), so a model
@@ -413,8 +413,8 @@ async function serve() {
     // interchangeable candidates of the same directory. Falls back to the post-compaction recalls.
     const sr = createRecallSessions({
       render: async (text, model) => (await renderTextToImages(text, { model, reflow: true })).pages,
-      maxChars: Number(process.env.PXLITE_RECALL_MAX_CHARS ?? 200_000),
-      maxImages: Number(process.env.PXLITE_RECALL_SESSION_MAX_IMAGES ?? 12),
+      maxChars: Number(process.env.PXLITE_RECALL_MAX_CHARS ?? 800_000),
+      maxImages: Number(process.env.PXLITE_RECALL_SESSION_MAX_IMAGES ?? 50),
     });
     stats.sessionRecall = sr.stats.claude;
     stats.openCodeSessionRecall = sr.stats.opencode;
