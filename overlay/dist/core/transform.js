@@ -1885,6 +1885,49 @@ async function runHistoryCollapseAndFinalize(req, info, o, opts, droppedCodepoin
  * unchanged.
  */
 export async function transformRequest(body, opts = {}) {
+    const res = await transformRequestInner(body, opts);
+    try {
+        const ttl = process.env.PXLITE_CACHE_TTL ?? '1h';
+        if (ttl === '5m' || ttl === 'off' || ttl === '')
+            return res;
+        const text = new TextDecoder().decode(res.body);
+        if (!text.includes('"cache_control"'))
+            return res;
+        const req = JSON.parse(text);
+        const marks = [];
+        const collect = (blocks) => {
+            if (!Array.isArray(blocks))
+                return;
+            for (const b of blocks) {
+                if (b && typeof b === 'object' && b.cache_control && typeof b.cache_control === 'object')
+                    marks.push(b.cache_control);
+            }
+        };
+        collect(req.tools);
+        collect(req.system);
+        if (Array.isArray(req.messages))
+            for (const m of req.messages)
+                collect(m && m.content);
+        // A client-chosen 5m marker must not be followed by a longer one, so leave it alone.
+        if (marks.length === 0 || marks.some((c) => c.ttl !== undefined && c.ttl !== ttl))
+            return res;
+        let changed = false;
+        for (const c of marks) {
+            if (c.ttl === undefined && (c.type === undefined || c.type === 'ephemeral')) {
+                c.ttl = ttl;
+                changed = true;
+            }
+        }
+        if (!changed)
+            return res;
+        res.info.cache_ttl = ttl;
+        return { ...res, body: new TextEncoder().encode(JSON.stringify(req)) };
+    }
+    catch {
+        return res;
+    }
+}
+async function transformRequestInner(body, opts = {}) {
     const profile = opts.model ? resolveGptProfile(opts.model) : undefined;
     const profileDefaults = profile
         ? { cols: profile.stripCols, model: opts.model }

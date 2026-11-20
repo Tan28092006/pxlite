@@ -35,7 +35,7 @@
     {
       "path": "dist/core/transform.js",
       "upstreamSha256": "545fbcfc4ed6ebc5ff19d3cd503432967666127a474828496c1b2447f83dc8df",
-      "overlaySha256": "78a11ab9dd09c096439bb30f69963f767d16f7007c00dc9395011e58dc496d81"
+      "overlaySha256": "cfeaeaa828fda4c47c768b774d743799580fb123df4884f3c47ac7ad02dcb33d"
     }
   ]
 }

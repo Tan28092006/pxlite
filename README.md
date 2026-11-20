@@ -73,6 +73,13 @@ A 4-file Codex check on terra answered every name and a 34-character `cache_id` 
 gpt-6.1-luna still passes through.
 pxlite strips `prompt_cache_breakpoint` from Responses requests because both the ChatGPT backend and api.openai.com reject it for Sol.
 The data-stays-text filter (`keepSharp`) exists only on pxpipe's Anthropic path; GPT history is imaged without it.
+`PXLITE_CACHE_TTL` (default `1h`): cache markers that arrive without a `ttl` (OpenCode sends none, so
+Anthropic used 5 minutes) get this ttl. Measured on 928 OpenCode requests: the 42 that came after a 5 to 60 minute
+pause hit the cache only 3 times and re-wrote 2.66M tokens. Markers with an explicit ttl are never touched, and a
+request whose client already chose another ttl is left as it is. `5m` or `off` turns it off. A 1h write costs 2x
+instead of 1.25x, so this pays only if you pause often.
+
+`PXLITE_KEEP_SCALE` (default `1.5`) multiplies every data-detection limit of that filter: higher images more, `1` is the original strictness, `0` images everything. `node scripts/keep-report.mjs` measures it on your own transcripts and events log.
 
 ## Recall an earlier session (Claude Code + OpenCode, 2026-11-17)
 
