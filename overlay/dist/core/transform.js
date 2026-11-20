@@ -3,6 +3,7 @@
  * renders them as PNG image blocks, and rewrites the body to reference those images —
  * saving 65-73% input tokens while preserving reasoning quality.
  */
+import { appendFileSync } from 'node:fs';
 import { renderTextToPngs, reflow, shrinkColsToContent, MAX_HEIGHT_PX, NL_SENTINEL, NL_SENTINEL_PAD_CELLS, neutralizeSentinel, PAD_X, PAD_Y, CELL_W, CELL_H, READABLE_CHARS_PER_IMAGE, DENSE_CONTENT_CHARS_PER_IMAGE, DENSE_CONTENT_COLS, DENSE_RENDER_STYLE, ANTHROPIC_SLAB_COLS, renderTextToPngsWithCharLimit, renderCellHeight, renderCellWidth, LINES_PER_IMAGE, maxCharsPerImage, } from './render.js';
 import { appendPinBlock, canAppendPinBlock, foldPins, stripPinCommands, stripPinCommandsFromSystem, } from './pin.js';
 import { factSheetText } from './factsheet.js';
@@ -1885,14 +1886,50 @@ async function runHistoryCollapseAndFinalize(req, info, o, opts, droppedCodepoin
  * unchanged.
  */
 export async function transformRequest(body, opts = {}) {
+    if (process.env.PXLITE_DEBUG_TTL) {
+        // Debug: log the cache_control markers exactly as the client sent them.
+        try {
+            const r0 = JSON.parse(new TextDecoder().decode(body));
+            const seen = [];
+            const scan = (where, blocks) => {
+                if (Array.isArray(blocks))
+                    blocks.forEach((b, i) => { if (b && b.cache_control)
+                        seen.push({ where: `${where}.${i}`, cc: b.cache_control }); });
+            };
+            scan('tools', r0.tools);
+            scan('system', r0.system);
+            (r0.messages ?? []).forEach((m, mi) => scan(`m${mi}`, m && m.content));
+            (await import('node:fs')).appendFileSync(process.env.PXLITE_DEBUG_TTL, JSON.stringify({ ts: new Date().toISOString(), model: r0.model, top_cc: r0.cache_control ?? null, seen }) + '\n');
+        }
+        catch { }
+    }
     const res = await transformRequestInner(body, opts);
+    // Debug: log the markers actually leaving for Anthropic (after the TTL rewrite).
+    const dbgOut = (out) => {
+        if (process.env.PXLITE_DEBUG_TTL) {
+            try {
+                const r1 = JSON.parse(new TextDecoder().decode(out.body));
+                const ttls = [];
+                const sc = (blocks) => { if (Array.isArray(blocks))
+                    for (const b of blocks)
+                        if (b && b.cache_control)
+                            ttls.push(b.cache_control.ttl ?? '5m(default)'); };
+                sc(r1.tools);
+                sc(r1.system);
+                (r1.messages ?? []).forEach((m) => sc(m && m.content));
+                appendFileSync(process.env.PXLITE_DEBUG_TTL, JSON.stringify({ ts: new Date().toISOString(), out: true, model: r1.model, ttls }) + '\n');
+            }
+            catch { }
+        }
+        return out;
+    };
     try {
         const ttl = process.env.PXLITE_CACHE_TTL ?? '1h';
         if (ttl === '5m' || ttl === 'off' || ttl === '')
-            return res;
+            return dbgOut(res);
         const text = new TextDecoder().decode(res.body);
         if (!text.includes('"cache_control"'))
-            return res;
+            return dbgOut(res);
         const req = JSON.parse(text);
         const marks = [];
         const collect = (blocks) => {
@@ -1910,7 +1947,7 @@ export async function transformRequest(body, opts = {}) {
                 collect(m && m.content);
         // A client-chosen 5m marker must not be followed by a longer one, so leave it alone.
         if (marks.length === 0 || marks.some((c) => c.ttl !== undefined && c.ttl !== ttl))
-            return res;
+            return dbgOut(res);
         let changed = false;
         for (const c of marks) {
             if (c.ttl === undefined && (c.type === undefined || c.type === 'ephemeral')) {
@@ -1919,12 +1956,12 @@ export async function transformRequest(body, opts = {}) {
             }
         }
         if (!changed)
-            return res;
+            return dbgOut(res);
         res.info.cache_ttl = ttl;
-        return { ...res, body: new TextEncoder().encode(JSON.stringify(req)) };
+        return dbgOut({ ...res, body: new TextEncoder().encode(JSON.stringify(req)) });
     }
     catch {
-        return res;
+        return dbgOut(res);
     }
 }
 async function transformRequestInner(body, opts = {}) {

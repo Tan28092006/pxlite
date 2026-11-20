@@ -37,6 +37,18 @@ export const LIMITS = {
   windowNumericShare: 0.4,
 };
 
+const BASE_LIMITS = { ...LIMITS };
+const SCALED = ['digitRatio', 'numericShare', 'hexPerLine', 'jsonKvPerLine', 'rowShare', 'timestampShare', 'windowDigitRatio', 'windowNumericShare'];
+// Looser (k > 1) keeps less text, so more is imaged. Applied once at startup, never per
+// request, so a block gets the same decision on every request (cache prefix stays stable).
+// k <= 0 means "never keep text": analyze() reports no reason for any block.
+let keepNothing = false;
+export function applyScale(k) {
+  keepNothing = !(k > 0);
+  for (const key of SCALED) LIMITS[key] = BASE_LIMITS[key] * (k > 0 ? k : 1);
+  return k;
+}
+
 /** Return the measured signals and the reason a block counts as data (or null). */
 export function analyze(text) {
   const sample = text.length > 200_000 ? text.slice(0, 100_000) + '\n' + text.slice(-100_000) : text;
@@ -63,6 +75,7 @@ export function analyze(text) {
     s.worstWindow = Math.max(s.worstWindow, Math.max(digitRatio(w) / LIMITS.windowDigitRatio, numericShare(w) / LIMITS.windowNumericShare));
   }
   let reason = null;
+  if (keepNothing) return { reason, signals: s };
   if (s.digitRatio >= LIMITS.digitRatio) reason = 'digits';
   else if (s.numericShare >= LIMITS.numericShare) reason = 'numbers';
   else if (s.hex >= LIMITS.hexMin && s.hex / n >= LIMITS.hexPerLine) reason = 'hex';

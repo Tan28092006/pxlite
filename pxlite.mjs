@@ -11,13 +11,14 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { analyze } from './classify.mjs';
+import { analyze, applyScale } from './classify.mjs';
 import { RotatingLog } from './rotlog.mjs';
 import { classifyCompaction, decodeRequestBody, stripCacheBreakpoints } from './compat.mjs';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createRecall, describeResponsesShape } from './recall.mjs';
 import { createClaudeRecall } from './recall-claude.mjs';
 import { createBlockDedupe, parseDedupeTags } from './dedupe-blocks.mjs';
+import { createToolCollapse, ttlMsOf } from './collapse-tools.mjs';
 import { listSessions, sessionInfo } from './recall-session.mjs';
 import { listOpenCodeSessions } from './recall-opencode-session.mjs';
 import { createRecallSessions } from './recall-sessions.mjs';
@@ -26,6 +27,7 @@ import { createRecallSessions } from './recall-sessions.mjs';
 let recall = null; // OpenCode, Responses
 let claudeRecall = null; // Claude Code, Messages
 let chatRecall = null; // OpenCode providers on Chat Completions (opencode/*, e.g. deepseek)
+let claudeToolCollapse = null; // old successful Bash/Edit/Write results (collapse-tools.mjs)
 let claudeDedupe = null; // repeated injected blocks in Claude Messages (dedupe-blocks.mjs)
 
 // Per-request flags read by proxyConfig.transform(), which pxpipe calls with no
@@ -247,6 +249,18 @@ async function toWebRequest(req) {
           console.warn(`[pxlite] dedupe skipped: ${err.message}`);
         }
       }
+      // Collapse old successful Bash/Edit/Write results (collapse-tools.mjs); never on the compaction request.
+      if (parsed && claudeToolCollapse && !c.compact) {
+        try {
+          const sessionKey = tags.session_id ? `${tags.session_id}\u0000${headers.get('x-claude-code-agent-id') ?? ''}` : null;
+          if (claudeToolCollapse.apply(parsed, { sessionKey }) > 0) {
+            bytes = Buffer.from(JSON.stringify(parsed));
+            headers.set('content-length', String(bytes.byteLength));
+          }
+        } catch (err) {
+          console.warn(`[pxlite] tool collapse skipped: ${err.message}`);
+        }
+      }
     }
     // Recall: OpenCode Responses (recall.mjs) and Claude Code Messages after a
     // compaction (recall-claude.mjs); never on the compaction request itself.
@@ -387,6 +401,17 @@ async function serve() {
     claudeDedupe = { apply: (body, opts) => (isPxpipeSupportedModel(String(body?.model ?? '')) ? d.apply(body, opts) : 0) };
   }
 
+  // PXLITE_TOOL_COLLAPSE=0 turns tool-result collapsing off; _CHUNK / _KEEP tune it (messages).
+  if (!disabled && !/^(0|false|no|off)$/i.test(process.env.PXLITE_TOOL_COLLAPSE ?? '')) {
+    const { isPxpipeSupportedModel } = await core('applicability.js');
+    const tc = createToolCollapse({
+      chunk: Number(process.env.PXLITE_TOOL_COLLAPSE_CHUNK ?? 100),
+      keepTail: Number(process.env.PXLITE_TOOL_COLLAPSE_KEEP ?? 30),
+      ttlMs: ttlMsOf(process.env.PXLITE_CACHE_TTL ?? '1h'),
+    });
+    claudeToolCollapse = { apply: (body, opts) => (isPxpipeSupportedModel(String(body?.model ?? '')) ? tc.apply(body, opts) : 0) };
+  }
+
   // Recall after OpenAI server-side compaction (recall.mjs). Off with PXLITE_RECALL=0.
   if (!disabled && !/^(0|false|no|off)$/i.test(process.env.PXLITE_RECALL ?? '')) {
     const [{ renderTextToImages }, { openAIImageDetail }, { responsesItemsToTurns }] = await Promise.all([core('library.js'), core('openai.js'), core('openai-history.js')]);
@@ -440,6 +465,11 @@ async function serve() {
     };
   }
 
+  // PXLITE_KEEP_SCALE: multiplier on every data-detection limit. Default 1.5 (measured with
+  // scripts/keep-report.mjs: keeps 16.7% of tool_result chars as text instead of 22.3%).
+  // Higher images more; 0 images everything, including numbers and JSON.
+  const keepScale = Number(process.env.PXLITE_KEEP_SCALE ?? 1.5);
+  applyScale(Number.isFinite(keepScale) ? keepScale : 1.5);
   const keepSharp = (block) => {
     const { reason } = analyze(block.text);
     if (reason) stats.keptText[reason] = (stats.keptText[reason] ?? 0) + 1;

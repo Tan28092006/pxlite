@@ -73,6 +73,17 @@ test('cross-source: the same directory serves Claude Code and OpenCode', async (
   assert.equal(r.stats.claude.injected, 1);
 });
 
+test('cross-source both ways: OpenCode recalls a Claude Code session, Claude Code recalls an OpenCode one', async () => {
+  const oc = harness(); // ctx is OpenCode
+  const toClaude = await oc.r.apply({ model: 'gpt-6.1-terra', prompt_cache_key: 'ses_current', input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'recall aaaaaaaa' }] }] }, new Headers());
+  assert.match(toClaude.input[0].content[0].text, /Claude Code/);
+  assert.deepEqual(oc.calls, ['aaaaaaaa-1111-2222-3333-444444444444']);
+  const cc = harness({ context: async () => ({ client: 'claude', sid: 'bbbbbbbb-0000-0000-0000-000000000000', dir: 'D:\\NASA' }) });
+  const toOpenCode = await cc.r.apply({ model: 'claude-sonnet-5-5', messages: [{ role: 'user', content: [{ type: 'text', text: 'recall ses_older' }] }] }, new Headers());
+  assert.match(toOpenCode.messages[0].content[0].text, /OpenCode/);
+  assert.deepEqual(cc.calls, ['ses_older']);
+});
+
 test('messages mount keeps the command last and a marker prevents a second copy', async () => {
   const { r } = harness();
   const body = { model: 'gpt-6.1-terra', messages: [{ role: 'user', content: [{ type: 'text', text: '<system-reminder>ctx</system-reminder>\nrecall vault' }] }] };
