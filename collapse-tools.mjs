@@ -1,9 +1,17 @@
-// Collapse old, successful tool results of Bash / Edit / Write in Anthropic Messages, OpenAI Chat\n// Completions and OpenAI Responses requests (OpenCode, Codex tool names included).
+// Collapse old tool results in Anthropic Messages, OpenAI Chat Completions and OpenAI Responses
+// requests (OpenCode, Codex tool names included).
 //
-// Rules (researched with scripts/collapse-sim.mjs on real transcripts, no API calls):
-//   * only Bash / Edit / Write / MultiEdit / NotebookEdit results are collapsible; Read, Grep,
-//     Glob, Web*, browse, subagents, MCP and graph tools are never touched
-//   * anything that looks like an error / failed test is kept whole
+// Rules (researched with scripts/collapse-sim.mjs and the OpenCode db on real transcripts, no API calls):
+//   * Bash / PowerShell / Edit / Write / MultiEdit / NotebookEdit / patch results are collapsible when they
+//     succeeded; web*, browse, subagents, MCP, graph tools, Grep and Glob are never touched
+//   * a success result that looks failed (error words in the first/last 300 chars, or a non-zero exit code)
+//     is kept whole; only the head and the tail are scanned, because file contents and match lines are full of
+//     the word "error"
+//   * Read is collapsible only when the agent no longer needs it: the same file was read again (same range, or a
+//     full read) or edited/written/patched later, inside the already-frozen prefix. Reads nobody superseded stay
+//     whole
+//   * shell rg / grep results are reduced to a `path: line,line,...` index (offsets kept, match text dropped),
+//     so the agent still knows where to `Read` with an offset
 //   * the newest `keepTail` messages are never collapsed (an agent in the middle of a task still sees them)
 //   * a collapsed result keeps its head and last line, so the agent still knows what happened
 //   * the collapse boundary only moves in two cases, so the cached prefix stays byte-identical:
@@ -11,10 +19,16 @@
 //          anyway, so the boundary jumps to (n - keepTail) for free
 //       2. the boundary lags by a whole chunk (`chunk` messages) AND the newly collapsible text is big
 //          enough to pay for rewriting the cache (`minGainChars`)
-//     Between moves the collapsed set is a pure function of the boundary, so requests keep cache hits.
-const COLLAPSIBLE = new Set(['bash', 'edit', 'write', 'multiedit', 'notebookedit', 'apply_patch', 'patch', 'shell', 'shell_command', 'exec_command']);
-const ERR_RE = /error|failed|failure|traceback|exception|exit code [1-9]|\bFAIL\b|not found|denied|cannot|can't|fatal|panic/i;
+//     Between moves the collapsed set is a pure function of the boundary (every decision, including
+//     "was this Read superseded", looks only at messages before the boundary), so requests keep cache hits.
+const SHELL = new Set(['bash', 'shell', 'shell_command', 'exec_command', 'powershell', 'pwsh']);
+const COLLAPSIBLE = new Set(['bash', 'edit', 'write', 'multiedit', 'notebookedit', 'apply_patch', 'patch', 'shell', 'shell_command', 'exec_command', 'powershell', 'pwsh']);
+const EDITS = new Set(['edit', 'write', 'multiedit', 'notebookedit', 'apply_patch', 'patch']);
+const ERR_RE = /error|failed|failure|traceback|exception|exit code:? *[1-9]|\bFAIL\b|not found|denied|cannot|can't|fatal|panic/i;
+const GREP_CMD_RE = /(?:^|&&|;|\|\|)\s*(?:rg|grep|egrep|git\s+grep|findstr|Select-String)\b/i;
 const MARKER = '[pxlite: older output collapsed';
+const GREP_MAX_CHARS = 1500;
+const GREP_MAX_LINES_PER_FILE = 20;
 
 export function ttlMsOf(ttl) {
   return ttl === '5m' ? 5 * 60_000 : 60 * 60_000;
@@ -26,6 +40,12 @@ function textOf(c) {
   return null; // images or unknown shape: leave alone
 }
 
+/** Errors / failed tests live at the ends of an output; scanning the middle only finds the word in file contents. */
+export function looksFailed(text) {
+  if (text.length <= 600) return ERR_RE.test(text);
+  return ERR_RE.test(text.slice(0, 300)) || ERR_RE.test(text.slice(-300));
+}
+
 function stub(text, headChars, tailChars) {
   const head = text.slice(0, headChars);
   const lastLine = text.trimEnd().split('\n').pop().slice(-tailChars);
@@ -33,13 +53,89 @@ function stub(text, headChars, tailChars) {
   return `${head}\n${MARKER}, ${dropped} chars dropped. last line: ${lastLine}]`;
 }
 
+const LINE_RE = /^((?:[A-Za-z]:[\\/])?[^:\n]+?):(\d+)[:-]/; // path:12:text  (rg -n, grep -n, findstr /n, Select-String)
+const BARE_RE = /^((?:[A-Za-z]:[\\/])?[^:\n]*[./\\][^:\n]*):(?!\d+[:-])/; // path:text (grep -r without -n)
+const HEAD_RE = /^(?:[A-Za-z]:[\\/])?[^:\n]*[./\\][^:\n]*$/; // rg --heading file line
+const NUM_RE = /^(\d+)[:-]/;
+
+/**
+ * rg / grep output -> `path: 12,40,88` index. Returns null when the output does not look like
+ * file:line matches (then the normal head/last-line stub is used).
+ */
+export function condenseGrep(text) {
+  const lines = text.split('\n').filter((l) => l.trim());
+  if (lines.length < 3) return null;
+  const files = new Map();
+  let matched = 0;
+  let heading = null;
+  const add = (path, line) => {
+    let f = files.get(path);
+    if (!f) files.set(path, (f = { lines: [], n: 0 }));
+    f.n++;
+    if (line !== null) f.lines.push(line);
+    matched++;
+  };
+  for (const l of lines) {
+    let m = LINE_RE.exec(l);
+    if (m) { add(m[1], Number(m[2])); continue; }
+    m = heading ? NUM_RE.exec(l) : null;
+    if (m) { add(heading, Number(m[1])); continue; }
+    if (HEAD_RE.test(l.trim()) && !/\s{2,}/.test(l)) { heading = l.trim(); continue; }
+    m = BARE_RE.exec(l);
+    if (m) { add(m[1], null); continue; }
+  }
+  if (!files.size || matched < lines.length * 0.5) return null;
+  const rows = [];
+  for (const [path, f] of files) {
+    const nums = [...new Set(f.lines)].sort((a, b) => a - b);
+    const shown = nums.slice(0, GREP_MAX_LINES_PER_FILE).join(',');
+    const more = nums.length > GREP_MAX_LINES_PER_FILE ? `,+${nums.length - GREP_MAX_LINES_PER_FILE} more` : '';
+    rows.push(nums.length ? `${path}: ${shown}${more}` : `${path}: ${f.n} matches`);
+  }
+  let body = '';
+  let shownFiles = 0;
+  for (const r of rows) {
+    if (body.length + r.length + 1 > GREP_MAX_CHARS) break;
+    body += `${r}\n`;
+    shownFiles++;
+  }
+  const extra = rows.length > shownFiles ? `, +${rows.length - shownFiles} more files` : '';
+  return `${MARKER}, grep output reduced to a file:line index (${matched} matches in ${files.size} files${extra}; match text dropped, Read the file at that offset or re-run the search to see it)]\n${body.trimEnd()}`;
+}
+
+function parseArgs(v) {
+  if (v && typeof v === 'object') return v;
+  if (typeof v === 'string') {
+    try {
+      const o = JSON.parse(v);
+      if (o && typeof o === 'object') return o;
+    } catch {
+      /* raw string input (custom tools such as apply_patch) */
+    }
+    return { _raw: v };
+  }
+  return {};
+}
+
+const normPath = (p) => String(p).trim().replace(/\\/g, '/').toLowerCase();
+const pathOf = (a) => {
+  const p = a.file_path ?? a.filePath ?? a.path ?? a.notebook_path ?? a.file;
+  return typeof p === 'string' && p ? normPath(p) : null;
+};
+const rangeSig = (a) => `${a.offset ?? ''}:${a.limit ?? ''}`;
+function patchPaths(a) {
+  const t = a._raw ?? a.patchText ?? a.patch ?? a.input;
+  if (typeof t !== 'string') return [];
+  return [...t.matchAll(/\*\*\* (?:Update|Add|Delete) File: ([^\n\r]+)/g)].map((m) => normPath(m[1]));
+}
+
 export function createToolCollapse({
   chunk = 100,
   keepTail = 30,
-  minSave = 200,
+  minSave = 100,
   minGainChars = 40_000,
-  headChars = 300,
-  tailChars = 150,
+  headChars = 150,
+  tailChars = 80,
   writeInputKeep = 600,
   ttlMs = 60 * 60_000,
   maxSessions = 500,
@@ -51,25 +147,53 @@ export function createToolCollapse({
   // (Anthropic Messages, or OpenAI Chat Completions) or body.input (OpenAI Responses). The
   // three wire shapes are disjoint, so one pass recognises whichever blocks are present.
   function scan(items, from, to) {
-    const names = new Map();
+    const calls = new Map(); // call id -> { name, seq, path, sig, cmd }
+    const touches = new Map(); // path -> [{ seq, sig, edit }] of later read / edit / write calls
+    let seq = 0;
+    const register = (id, name, rawArgs) => {
+      if (!id) return;
+      const n = String(name ?? '').toLowerCase();
+      const a = parseArgs(rawArgs);
+      const c = { name: n, seq: seq++, path: pathOf(a), sig: rangeSig(a), cmd: typeof (a.command ?? a.cmd) === 'string' ? (a.command ?? a.cmd) : '' };
+      calls.set(id, c);
+      const touch = (p, edit) => {
+        if (!p) return;
+        if (!touches.has(p)) touches.set(p, []);
+        touches.get(p).push({ seq: c.seq, sig: c.sig, edit });
+      };
+      if (n === 'read') touch(c.path, false);
+      else if (EDITS.has(n)) {
+        touch(c.path, true);
+        if (n === 'apply_patch' || n === 'patch') for (const p of patchPaths(a)) touch(p, true);
+      }
+    };
     for (let i = 0; i < to; i++) {
       const m = items[i];
       if (!m) continue;
       if (m.role === 'assistant' && Array.isArray(m.content)) {
-        for (const b of m.content) if (b?.type === 'tool_use' && b.id) names.set(b.id, String(b.name ?? '').toLowerCase());
+        for (const b of m.content) if (b?.type === 'tool_use') register(b.id, b.name, b.input);
       }
       if (m.role === 'assistant' && Array.isArray(m.tool_calls)) {
-        for (const tc of m.tool_calls) if (tc?.id) names.set(tc.id, String(tc.function?.name ?? '').toLowerCase());
+        for (const tc of m.tool_calls) if (tc?.id) register(tc.id, tc.function?.name, tc.function?.arguments);
       }
-      if ((m.type === 'function_call' || m.type === 'custom_tool_call') && m.call_id) names.set(m.call_id, String(m.name ?? '').toLowerCase());
+      if ((m.type === 'function_call' || m.type === 'custom_tool_call') && m.call_id) register(m.call_id, m.name, m.arguments ?? m.input);
     }
+    // A Read is dead weight once a later read of the same range (or a full read) or any edit of that file exists.
+    const superseded = (c) => !!c.path && (touches.get(c.path) ?? []).some((t) => t.seq > c.seq && (t.edit || t.sig === c.sig || t.sig === ':'));
     const found = [];
     const addResult = (id, isErr, read, write) => {
-      if (isErr || !COLLAPSIBLE.has(names.get(id))) return;
+      const c = calls.get(id);
+      if (isErr || !c) return;
+      const isRead = c.name === 'read';
+      const isGrep = SHELL.has(c.name) && GREP_CMD_RE.test(c.cmd);
+      if (!isRead && !COLLAPSIBLE.has(c.name)) return;
+      if (isRead && !superseded(c)) return;
       const text = read();
-      if (text === null || text.includes(MARKER) || ERR_RE.test(text)) return;
-      const saved = text.length - (headChars + tailChars + 80);
-      if (saved >= minSave) found.push({ saved, run: () => write(stub(text, headChars, tailChars)) });
+      if (text === null || text.includes(MARKER)) return;
+      if (!isRead && !isGrep && looksFailed(text)) return;
+      const rep = (isGrep && condenseGrep(text)) || stub(text, headChars, tailChars);
+      const saved = text.length - rep.length;
+      if (saved >= minSave) found.push({ saved, run: () => write(rep) });
     };
     const addWrite = (name, content, write) => {
       if (name === 'write' && typeof content === 'string' && content.length > writeInputKeep + minSave) {
@@ -126,6 +250,7 @@ export function createToolCollapse({
       st.boundary = Math.max(st.boundary, target); // cache expired: moving the boundary is free
     } else if (target - st.boundary >= chunk) {
       const next = st.boundary + Math.floor((target - st.boundary) / chunk) * chunk;
+      // the gain of the chunk [boundary, next) with every decision evaluated as of `next`
       const gain = scan(messages, st.boundary, next).reduce((a, f) => a + f.saved, 0);
       if (gain >= minGainChars) st.boundary = next;
     }

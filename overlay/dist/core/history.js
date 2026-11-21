@@ -649,12 +649,12 @@ export function estimateCollapseShrinkTokens(messages, from, to, renderedChars, 
 export async function collapseHistory(messages, isProfitable, opts = {}) {
     const o = { ...HISTORY_DEFAULTS, ...opts };
     // pxlite: overflow override. When the whole context (new text + prior warm images)
-    // is already above PXLITE_FORCE_COLLAPSE_TOKENS (default 250k), collapse regardless of
+    // is already above PXLITE_FORCE_COLLAPSE_TOKENS (default 180k), collapse regardless of
     // the message-count / min-shrink gates: a huge window is worth rewriting even if cold.
     let forceCollapse = false;
     {
-        const envForce = Number.parseInt(process.env.PXLITE_FORCE_COLLAPSE_TOKENS ?? '250000', 10);
-        const forceAt = Number.isFinite(envForce) ? envForce : 250000;
+        const envForce = Number.parseInt(process.env.PXLITE_FORCE_COLLAPSE_TOKENS ?? '180000', 10);
+        const forceAt = Number.isFinite(envForce) ? envForce : 180000;
         if (forceAt > 0) {
             const ctxTokens = Math.round(rawMessageChars(messages, 0, messages.length) / GATE_RAW_CPT) + Math.max(0, o.priorWarmImageTokens ?? 0);
             forceCollapse = ctxTokens >= forceAt;

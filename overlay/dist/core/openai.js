@@ -215,10 +215,10 @@ function pxliteEnvInt(name, dflt) {
     return Number.isFinite(n) && n >= 0 ? n : dflt;
 }
 // Force-collapse: when estimated live context (chars/3 + ~1500 tokens per image) reaches
-// PXLITE_FORCE_COLLAPSE_TOKENS (default 250000, 0 disables), drop the message-count and
+// PXLITE_FORCE_COLLAPSE_TOKENS (default 180000, 0 disables), drop the message-count and
 // token-floor gates so a very long history with few messages still compresses.
 function pxliteGptForced(payload, imageCount) {
-    const limit = pxliteEnvInt('PXLITE_FORCE_COLLAPSE_TOKENS', 250000);
+    const limit = pxliteEnvInt('PXLITE_FORCE_COLLAPSE_TOKENS', 180000);
     if (!limit) return false;
     let chars = 0;
     try { chars = JSON.stringify(payload).length; } catch { return false; }

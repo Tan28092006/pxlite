@@ -1,4 +1,4 @@
-// Overflow override: context >= PXLITE_FORCE_COLLAPSE_TOKENS (250k) collapses even when
+// Overflow override: context >= PXLITE_FORCE_COLLAPSE_TOKENS (180k) collapses even when
 // the normal gates (min messages, min shrink, profitability) would refuse.
 import assert from 'node:assert/strict';
 import { collapseHistory } from './vendor/pxpipe-proxy/dist/core/history.js';
@@ -23,7 +23,7 @@ assert.ok(!(small.info.collapsedTurns > 0), 'small history must not collapse');
 // 2. 20 turns (40 msgs < 50) but ~900k chars (~300k tokens): forced.
 const big = mk(20, 22000);
 const forced = await run(big);
-assert.ok(forced.info.collapsedTurns > 0, 'over 250k tokens must collapse: ' + forced.info.reason);
+assert.ok(forced.info.collapsedTurns > 0, 'over 180k tokens must collapse: ' + forced.info.reason);
 assert.equal(forced.info.forced, true);
 
 // 3. Same history, force disabled: refused by the 50-message gate.

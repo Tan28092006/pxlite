@@ -137,7 +137,7 @@ test('chat completions: collapses old bash/write results, keeps read, errors and
   const tool = (i) => b.messages.find((m) => m.role === 'tool' && m.tool_call_id === `c${i}`);
   assert.ok(tool(0).content.includes('pxlite: older output collapsed') && tool(0).content.length < 600);
   assert.equal(tool(1).content.length, BIG.length + 12); // error kept whole
-  assert.equal(tool(3).content, BIG); // read never touched
+  assert.ok(tool(3).content.includes('pxlite: older output collapsed')); // read of 'a', then 'a' written later: superseded
   assert.equal(tool(29).content, BIG); // inside keepTail
   const w = b.messages.find((m) => m.tool_calls?.[0].id === 'c2').tool_calls[0].function.arguments;
   assert.ok(JSON.parse(w).content.length < 800 && JSON.parse(w).filePath === 'a');
@@ -171,4 +171,87 @@ test('responses/chat: prefix before the boundary is byte-identical across reques
     const cut = Math.max(0, arr(a).length - 10) - 1;
     assert.equal(JSON.stringify(arr(a).slice(0, cut)), JSON.stringify(arr(b).slice(0, cut)));
   }
+});
+
+// ---- smarter rules: powershell, ends-only error scan, superseded Read, rg index ----
+const ASSERT_MARK = 'pxlite: older output collapsed';
+const FILLER = 'some ordinary output line\n'.repeat(80);
+function seqConvo(calls) {
+  // calls: [{ name, input, out }] -> Anthropic Messages, followed by padding turns so everything is before the boundary
+  const messages = [{ role: 'user', content: 'start' }];
+  calls.forEach((c, i) => {
+    messages.push({ role: 'assistant', content: [{ type: 'tool_use', id: `k${i}`, name: c.name, input: c.input ?? {} }] });
+    messages.push({ role: 'user', content: [{ type: 'tool_result', tool_use_id: `k${i}`, content: c.out }] });
+  });
+  return { messages };
+}
+const resultOf = (b, i) => b.messages[2 + i * 2].content[0].content;
+const pad = (n) => Array.from({ length: n }, () => ({ name: 'Bash', input: { command: 'echo' }, out: 'ok\n' + FILLER }));
+
+test('powershell results collapse like bash', () => {
+  const b = seqConvo([{ name: 'powershell', input: { command: 'Get-ChildItem' }, out: FILLER }, ...pad(8)]);
+  createToolCollapse({ keepTail: 4 }).apply(b, { sessionKey: 'p' });
+  assert.ok(resultOf(b, 0).includes(ASSERT_MARK));
+});
+
+test('error words are only looked for at the head and tail', () => {
+  const mid = FILLER + 'Error: that is just file content\n' + FILLER + 'all done';
+  const tailFail = FILLER + '5 tests failed';
+  const exitCode = FILLER + 'Exit code: 1';
+  const headErr = 'Error: boom\n' + FILLER;
+  const b = seqConvo([mid, tailFail, exitCode, headErr].map((out) => ({ name: 'Bash', input: { command: 'x' }, out })).concat(pad(8)));
+  createToolCollapse({ keepTail: 4 }).apply(b, { sessionKey: 'e' });
+  assert.ok(resultOf(b, 0).includes(ASSERT_MARK), 'middle-only error word is collapsed');
+  assert.ok(!resultOf(b, 1).includes(ASSERT_MARK), 'failure summary at the tail is kept');
+  assert.ok(!resultOf(b, 2).includes(ASSERT_MARK), 'non-zero exit code is kept');
+  assert.ok(!resultOf(b, 3).includes(ASSERT_MARK), 'error at the head is kept');
+});
+
+test('Read: collapsed only when re-read (same range / full) or edited later; otherwise kept', () => {
+  const R = (path, extra = {}) => ({ name: 'Read', input: { file_path: path, ...extra } });
+  const b = seqConvo([
+    { ...R('/p/a.js'), out: FILLER }, // 0: re-read in full later -> collapse
+    { ...R('/p/b.js'), out: FILLER }, // 1: edited later -> collapse
+    { ...R('/p/c.js'), out: FILLER }, // 2: never touched again -> keep
+    { ...R('/p/d.js', { offset: 0, limit: 50 }), out: FILLER }, // 3: other range read later -> keep
+    { ...R('/p/a.js'), out: FILLER }, // 4: the re-read itself, latest read of a.js -> keep
+    { name: 'Edit', input: { file_path: '/p/b.js' }, out: 'edited' }, // 5
+    { ...R('/p/d.js', { offset: 100, limit: 50 }), out: FILLER }, // 6
+    { ...R('/P\\E.js'), out: FILLER }, // 7: path spelling differs but same file, patched below
+    { name: 'apply_patch', input: { patchText: '*** Begin Patch\n*** Update File: /p/e.js\n*** End Patch' }, out: 'patched' }, // 8
+    ...pad(8),
+  ]);
+  createToolCollapse({ keepTail: 4 }).apply(b, { sessionKey: 'r' });
+  const c = (i) => resultOf(b, i).includes(ASSERT_MARK);
+  assert.deepEqual([0, 1, 2, 3, 4, 6, 7].map(c), [true, true, false, false, false, false, true]);
+});
+
+test('Read: a later re-read that is still after the boundary does not change the frozen prefix', () => {
+  const calls = [{ name: 'Read', input: { file_path: '/p/a.js' }, out: FILLER }, ...pad(30)];
+  const early = seqConvo(calls);
+  const late = seqConvo([...calls, { name: 'Read', input: { file_path: '/p/a.js' }, out: FILLER }]);
+  createToolCollapse({ keepTail: 20 }).apply(early, { sessionKey: 'x' });
+  createToolCollapse({ keepTail: 20 }).apply(late, { sessionKey: 'x' });
+  assert.ok(!resultOf(early, 0).includes(ASSERT_MARK)); // nothing superseded it yet
+  assert.ok(!resultOf(late, 0).includes(ASSERT_MARK)); // re-read sits inside keepTail, outside the boundary
+});
+
+test('rg / grep results become a path: line index; other shell output keeps the head/last-line stub', () => {
+  const rg = [];
+  for (let i = 1; i <= 60; i++) rg.push(`src/core/history.js:${i * 7}:  const veryLongMatchedLine${i} = somethingElse(${i}); // padding padding padding`);
+  for (let i = 1; i <= 5; i++) rg.push(`C:\\repo\\a.mjs:${i}:text text text text text text text text`);
+  const out = rg.join('\n');
+  const b = seqConvo([
+    { name: 'Bash', input: { command: 'rg -n "veryLong" src' }, out },
+    { name: 'Bash', input: { command: 'cd x && grep -rn foo .' }, out: 'not file lines at all\n'.repeat(60) },
+    ...pad(8),
+  ]);
+  createToolCollapse({ keepTail: 4 }).apply(b, { sessionKey: 'g' });
+  const r = resultOf(b, 0);
+  assert.ok(r.includes(ASSERT_MARK) && r.includes('src/core/history.js: 7,14,21'));
+  assert.ok(r.includes('C:\\repo\\a.mjs: 1,2,3,4,5'), 'windows drive paths survive');
+  assert.ok(!r.includes('veryLongMatchedLine'), 'match text is dropped');
+  assert.ok(r.length < 1700);
+  const o = resultOf(b, 1);
+  assert.ok(o.includes(ASSERT_MARK) && o.startsWith('not file lines'));
 });
