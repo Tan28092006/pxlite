@@ -4,6 +4,9 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 process.env.PXPIPE_MODELS ??= 'claude-opus-5-5';
+// Short test histories: turn pxlite's profit gates off so collapse is actually exercised.
+process.env.PXLITE_MIN_SHRINK_TOKENS ??= '0';
+process.env.PXLITE_MIN_COLLAPSE_MESSAGES ??= '0';
 const core = new URL('./vendor/pxpipe-proxy/dist/core/', import.meta.url).href;
 const { transformRequest, markLastHistoryImage, MAX_CACHE_BREAKPOINTS } = await import(core + 'transform.js');
 const { HISTORY_SYNTHETIC_INTRO } = await import(core + 'history.js');

@@ -4,6 +4,10 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+
+// These tests use short histories; pxlite's profit gates (25k tokens / 50 messages) would skip them.
+process.env.PXLITE_MIN_SHRINK_TOKENS ??= '0';
+process.env.PXLITE_MIN_COLLAPSE_MESSAGES ??= '0';
 import { analyze, isDataLike } from './classify.mjs';
 import { RotatingLog } from './rotlog.mjs';
 import { classifyCompaction, decodeRequestBody, isCompactionRequest, stripCacheBreakpoints } from './compat.mjs';
