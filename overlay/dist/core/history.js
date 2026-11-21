@@ -648,7 +648,19 @@ export function estimateCollapseShrinkTokens(messages, from, to, renderedChars, 
  */
 export async function collapseHistory(messages, isProfitable, opts = {}) {
     const o = { ...HISTORY_DEFAULTS, ...opts };
-    {   // pxlite: first collapse needs >= 50 messages (env), no more collapsing 14-message sessions
+    // pxlite: overflow override. When the whole context (new text + prior warm images)
+    // is already above PXLITE_FORCE_COLLAPSE_TOKENS (default 250k), collapse regardless of
+    // the message-count / min-shrink gates: a huge window is worth rewriting even if cold.
+    let forceCollapse = false;
+    {
+        const envForce = Number.parseInt(process.env.PXLITE_FORCE_COLLAPSE_TOKENS ?? '250000', 10);
+        const forceAt = Number.isFinite(envForce) ? envForce : 250000;
+        if (forceAt > 0) {
+            const ctxTokens = Math.round(rawMessageChars(messages, 0, messages.length) / GATE_RAW_CPT) + Math.max(0, o.priorWarmImageTokens ?? 0);
+            forceCollapse = ctxTokens >= forceAt;
+        }
+    }
+    if (!forceCollapse) {   // pxlite: first collapse needs >= 50 messages (env), no more collapsing 14-message sessions
         const envMin = Number.parseInt(process.env.PXLITE_MIN_COLLAPSE_MESSAGES ?? '50', 10);
         if (opts.minCollapsePrefix === undefined && Number.isFinite(envMin) && envMin >= 0)
             o.minCollapsePrefix = Math.max(o.minCollapsePrefix, envMin);
@@ -754,7 +766,8 @@ export async function collapseHistory(messages, isProfitable, opts = {}) {
         const minShrink = opts.minShrinkTokens !== undefined ? opts.minShrinkTokens : (Number.isFinite(envShrink) ? envShrink : 25000);
         const est = estimateCollapseShrinkTokens(messages, protectedPrefix, collapseLen, text.length, o.priorWarmImageTokens ?? 0);
         info.estShrinkTokens = est;
-        if (minShrink > 0 && est < minShrink) {
+        if (forceCollapse) info.forced = true;
+        if (forceCollapse ? est <= 0 : (minShrink > 0 && est < minShrink)) {
             info.reason = 'low_shrink';
             return { messages, info };
         }
@@ -765,7 +778,7 @@ export async function collapseHistory(messages, isProfitable, opts = {}) {
     // `text` stays original — it backs `collapsedChars` and the cache byte-stability.
     const safeText = neutralizeSentinel(text);
     const renderText = o.reflow ? reflow(safeText) ?? safeText : text;
-    if (!isProfitable(renderText, o.cols)) { // pass string, not length — see ProfitableFn
+    if (!forceCollapse && !isProfitable(renderText, o.cols)) { // pass string, not length — see ProfitableFn
         info.reason = 'not_profitable';
         info.collapsedChars = text.length; // surface what we DIDN'T compress
         return { messages, info };
