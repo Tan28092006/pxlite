@@ -903,7 +903,43 @@ export const RESPONSES_HEADER = '================= RENDERED GPT SYSTEM + TOOL CO
     '\n====================== BEGIN RENDERED CONTEXT ======================\n';
 const CHAT_POINTER = 'The full instructions for this message were rendered into image(s) attached to the first user message by pxpipe. Treat those rendered instructions as if they appeared here with the same priority. Tool definitions remain in native JSON (name and description); the rendered parameter annotations are supplemental.';
 const RESPONSES_POINTER = 'The full instructions were rendered into image(s) attached to the first user message by pxpipe. Treat them with the same priority. Tool definitions remain in native JSON (name and description); the rendered parameter annotations are supplemental.';
+// pxlite: keep only the newest N client-pasted images (default 15); older ones become a
+// text marker. Runs on the raw body before any other rewrite so every later stage sees
+// the pruned request (and the prefix stays byte-stable between requests).
+function gptKeepImages() {
+    const n = Number(process.env.PXLITE_KEEP_NATIVE_IMAGES);
+    return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 15;
+}
+export function pruneOldGptImages(body, keepN = gptKeepImages()) {
+    let req;
+    try {
+        req = JSON.parse(new TextDecoder().decode(body));
+    }
+    catch {
+        return body;
+    }
+    const list = Array.isArray(req?.input) ? req.input : Array.isArray(req?.messages) ? req.messages : null;
+    if (!list)
+        return body;
+    const slots = [];
+    const isImg = (p) => p && typeof p === 'object' && (p.type === 'input_image' || p.type === 'image_url');
+    for (const item of list) {
+        if (!item || !Array.isArray(item.content))
+            continue;
+        item.content.forEach((p, i) => { if (isImg(p))
+            slots.push({ arr: item.content, i }); });
+    }
+    if (slots.length <= keepN)
+        return body;
+    const drop = slots.slice(0, slots.length - keepN);
+    for (const s of drop)
+        s.arr[s.i] = { type: s.arr[s.i].type === 'input_image' ? 'input_text' : 'text', text: `[image omitted: older than the last ${keepN} images]` };
+    return new TextEncoder().encode(JSON.stringify(req));
+}
 export async function transformOpenAIChatCompletions(body, opts = {}) {
+    return transformOpenAIChatCompletionsInner(pruneOldGptImages(body), opts);
+}
+async function transformOpenAIChatCompletionsInner(body, opts = {}) {
     const o = resolveOptions(opts);
     const info = emptyInfo();
     if (!o.compress) {
@@ -1093,6 +1129,9 @@ export async function transformOpenAIChatCompletions(body, opts = {}) {
     return { body: new TextEncoder().encode(JSON.stringify(req)), info };
 }
 export async function transformOpenAIResponses(body, opts = {}) {
+    return transformOpenAIResponsesInner(pruneOldGptImages(body), opts);
+}
+async function transformOpenAIResponsesInner(body, opts = {}) {
     const o = resolveOptions(opts);
     const info = emptyInfo();
     if (!o.compress) {

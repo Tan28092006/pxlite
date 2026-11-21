@@ -1522,6 +1522,101 @@ export function countNativeImageBytes(messages) {
     }
     return bytes;
 }
+// pxlite: keep only the most recent N client-pasted images at full fidelity.
+// Older ones become a one-line text marker (the model has already described what it
+// needed from them in its own replies). Images inside the collapsed range are
+// re-attached next to the slab instead of being flattened to "[image]".
+const NATIVE_IMAGES_BY_REQ = new WeakMap();
+export function nativeImageKeep() {
+    const n = Number(process.env.PXLITE_KEEP_NATIVE_IMAGES);
+    return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 15;
+}
+function listNativeImageBlocks(messages) {
+    const out = [];
+    for (const m of messages ?? []) {
+        if (!m || !Array.isArray(m.content))
+            continue;
+        for (const b of m.content) {
+            if (b?.type === 'image' && typeof b.source?.data === 'string')
+                out.push(b);
+            else if (b?.type === 'tool_result' && Array.isArray(b.content)) {
+                for (const s of b.content)
+                    if (s?.type === 'image' && typeof s.source?.data === 'string')
+                        out.push(s);
+            }
+        }
+    }
+    return out;
+}
+export function rememberNativeImages(req) {
+    NATIVE_IMAGES_BY_REQ.set(req, listNativeImageBlocks(req.messages));
+}
+export function applyNativeImagePolicy(req, info) {
+    const orig = NATIVE_IMAGES_BY_REQ.get(req);
+    if (!orig || orig.length === 0 || !Array.isArray(req.messages))
+        return;
+    const keepN = nativeImageKeep();
+    const keepBlocks = keepN === 0 ? [] : orig.slice(-keepN);
+    const keepData = new Set(keepBlocks.map((b) => b.source.data));
+    const allData = new Set(orig.map((b) => b.source.data));
+    const marker = () => ({ type: 'text', text: `[image omitted: older than the last ${keepN} images]` });
+    // 1. Drop client images that are not among the newest N (works on the final messages).
+    let dropped = 0;
+    const present = new Set();
+    for (const m of req.messages) {
+        if (!Array.isArray(m?.content))
+            continue;
+        m.content = m.content.map((b) => {
+            if (b?.type === 'image' && allData.has(b.source?.data)) {
+                if (keepData.has(b.source.data)) {
+                    present.add(b.source.data);
+                    return b;
+                }
+                dropped++;
+                return marker();
+            }
+            if (b?.type === 'tool_result' && Array.isArray(b.content)) {
+                b.content = b.content.map((s) => {
+                    if (s?.type === 'image' && allData.has(s.source?.data)) {
+                        if (keepData.has(s.source.data)) {
+                            present.add(s.source.data);
+                            return s;
+                        }
+                        dropped++;
+                        return marker();
+                    }
+                    return s;
+                });
+            }
+            return b;
+        });
+    }
+    // 2. Re-attach kept images that the collapse swallowed. They go right after the
+    //    last image block of the first message that already carries images (the slab).
+    const missing = [];
+    const seen = new Set();
+    for (const b of keepBlocks) {
+        if (present.has(b.source.data) || seen.has(b.source.data))
+            continue;
+        seen.add(b.source.data);
+        missing.push(b);
+    }
+    let restored = 0;
+    if (missing.length > 0) {
+        const host = req.messages.find((m) => Array.isArray(m?.content) && m.content.some((b) => b?.type === 'image'));
+        if (host) {
+            let at = -1;
+            host.content.forEach((b, i) => { if (b?.type === 'image')
+                at = i; });
+            host.content.splice(at + 1, 0, ...missing.map((b) => ({ type: 'image', source: b.source })));
+            restored = missing.length;
+        }
+    }
+    if (dropped > 0)
+        info.nativeImagesDropped = dropped;
+    if (restored > 0)
+        info.nativeImagesRestored = restored;
+}
 /** Count image blocks already present in the caller's messages. Runs BEFORE any
  *  rewrite, so it sees the client's images only — ours do not exist yet. */
 export function countNativeImages(messages) {
@@ -1897,6 +1992,7 @@ async function runHistoryCollapseAndFinalize(req, info, o, opts, droppedCodepoin
     const toolResultsImaged = o.compressToolResults
         ? await compressToolResultsInPlace(req, info, o, denseGateGeometry(o), droppedCodepoints)
         : false;
+    applyNativeImagePolicy(req, info);
     // pxlite: same as the main path — after every marker move, before the body is serialized.
     if (collapsedFlag)
         markLastHistoryImage(req);
@@ -2066,6 +2162,7 @@ async function transformRequestInner(body, opts = {}) {
     // later path (slab, tool_results, history) rewrites content in place.
     info.nativeImages = countNativeImages(req.messages);
     info.nativeImageBytes = countNativeImageBytes(req.messages);
+    rememberNativeImages(req);
     // 0. User-pinned instructions. Fold the transcript's pin commands, then remove
     //    them from the outbound copy — the client's own transcript is untouched, so
     //    the next request still carries every command and re-derives the same state.
@@ -2570,6 +2667,7 @@ async function transformRequestInner(body, opts = {}) {
     // `imageHeadroom(info)` is the headroom left after the collapse spent its
     // share. Out of headroom degrades to sharp text, which is the safe direction.
     await compressToolResultsInPlace(req, info, o, denseGeo, droppedCodepoints);
+    applyNativeImagePolicy(req, info);
     // pxlite: after every marker move above, so the budget check sees final positions.
     if (info.historyReason === 'collapsed')
         markLastHistoryImage(req);

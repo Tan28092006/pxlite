@@ -35,7 +35,7 @@
     {
       "path": "dist/core/openai.js",
       "upstreamSha256": "514ec43ab6d17a37434ec866711ff31b684ae12b5865200029194c8045b37c5f",
-      "overlaySha256": "6025521967cdc5c71162e2507d280d7306438abbd0b336152cce9e519cf1a088"
+      "overlaySha256": "c82d2969e84edafb9ef0c4047103de2f5f71d94c631199f6618f6734586bac54"
     },
     {
       "path": "dist/core/tracker.js",
@@ -45,7 +45,7 @@
     {
       "path": "dist/core/transform.js",
       "upstreamSha256": "545fbcfc4ed6ebc5ff19d3cd503432967666127a474828496c1b2447f83dc8df",
-      "overlaySha256": "dd770ff7e179a0c55b24867dc0f798b2810ce805f6623698c491c5e7c59e7cc2"
+      "overlaySha256": "5682d08f8d10bfc877b92491c4eaf91fa3f274f93cd26fe580df3158e15532d0"
     }
   ]
 }
