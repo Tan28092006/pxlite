@@ -28,9 +28,14 @@
       "overlaySha256": "2dd40ffee192c823d551f53799d7d13efcaf22318a3f9e16b7e0708070d1b6f9"
     },
     {
+      "path": "dist/core/openai-history.js",
+      "upstreamSha256": "cb8bc0c34c817fe300fa74fd48f96e10c947536d1c933d83726cbf6925d682e5",
+      "overlaySha256": "038f840052dbcf999aab5cf5fabd0a7ae1f4e4f4102a8586d6336f971a64c8aa"
+    },
+    {
       "path": "dist/core/openai.js",
       "upstreamSha256": "514ec43ab6d17a37434ec866711ff31b684ae12b5865200029194c8045b37c5f",
-      "overlaySha256": "3f347a6d5f3d4369abb52a5ab0c55a2f5e2b221a9ba01c53727296f5bb514096"
+      "overlaySha256": "cf5bd78260c8bbf576d90de5b166e603033310b093ef4f930b319783e6c85f1a"
     },
     {
       "path": "dist/core/tracker.js",

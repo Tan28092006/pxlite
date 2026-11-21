@@ -745,7 +745,7 @@ async function applyChatHistoryCollapse(req, info, o, profile, protectedPrefix) 
     // messages (instead of also adding info.imageCount) avoids double-counting
     // the slab and matches the Responses path's budget math.
     const existingImages = countRequestImages(req.messages);
-    const plan = await planGptCollapse(chatMessagesToTurns(req.messages), protectedPrefix, profitable, gptHistoryOpts(req.model, o, profile, existingImages, pxliteGptForced(req.messages, existingImages)));
+    const plan = await planGptCollapse(chatMessagesToTurns(req.messages, { dropTools: true }), protectedPrefix, profitable, gptHistoryOpts(req.model, o, profile, existingImages, pxliteGptForced(req.messages, existingImages)));
     foldGptHistory(info, req.model, plan);
     const allImages = [...plan.images, ...plan.imagesAfter];
     if (allImages.length === 0)

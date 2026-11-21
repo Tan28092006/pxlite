@@ -1,4 +1,4 @@
-{
+﻿{
   "name": "pxlite",
   "version": "1.0.0",
   "description": "Slim launcher around pxpipe-proxy 0.16.0 for long Claude Code, OpenCode and Codex sessions: images prose and code history, Vietnamese glyph atlases, recall of earlier sessions.",
@@ -15,6 +15,7 @@
   },
   "scripts": {
     "postinstall": "node scripts/postinstall.mjs",
-    "test": "node --test test.mjs test-recall-sessions.mjs test-opencode-session.mjs test-serve.mjs test-cost-report.mjs test-history-cache-marker.mjs test-dedupe-blocks.mjs test-cache-ttl.mjs test-collapse-tools.mjs"
+    "test": "node --test test.mjs test-recall-sessions.mjs test-opencode-session.mjs test-serve.mjs test-cost-report.mjs test-history-cache-marker.mjs test-dedupe-blocks.mjs test-cache-ttl.mjs test-collapse-tools.mjs test-gpt-history-drop.mjs"
   }
 }
+
