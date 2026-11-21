@@ -224,7 +224,23 @@ function pxliteGptForced(payload, imageCount) {
     try { chars = JSON.stringify(payload).length; } catch { return false; }
     return chars / 3 + (imageCount || 0) * 1500 >= limit;
 }
-function gptHistoryOpts(model, o, profile, existingImages = 0, forced = false) {
+// pxlite: tail floors that mirror the Claude path (history.js keepTail 4; 12 inside a tool chain).
+// The GPT profile default (keepTail 1) left the live tail almost empty. Env: PXLITE_GPT_KEEP_TAIL,
+// PXLITE_TOOL_ROUND_KEEP_TAIL (chain, in messages/items), PXLITE_TOOL_ROUND_CUT=0 turns the chain rule off.
+export function pxliteTailFloors(items) {
+    const base = pxliteEnvInt('PXLITE_GPT_KEEP_TAIL', 4);
+    const chainEnv = Number.parseInt(process.env.PXLITE_TOOL_ROUND_KEEP_TAIL ?? '', 10);
+    const chain = Number.isFinite(chainEnv) && chainEnv >= 0 ? chainEnv : 12;
+    const last = Array.isArray(items) ? items.slice(-3) : [];
+    const inChain = process.env.PXLITE_TOOL_ROUND_CUT !== '0' && last.some((m) => m && (m.role === 'tool' || (Array.isArray(m.tool_calls) && m.tool_calls.length > 0) || m.type === 'function_call' || m.type === 'function_call_output'));
+    return {
+        keepTail: inChain ? Math.max(base, chain) : base,
+        // Responses counts call+output pairs: 2 items per pair
+        keepRecentPairs: inChain ? Math.max(base, Math.ceil(chain / 2)) : base,
+    };
+}
+function gptHistoryOpts(model, o, profile, existingImages = 0, forced = false, items = null) {
+    const floors = pxliteTailFloors(items);
     const configuredMax = o.gptHistory?.maxImages ?? configuredHistoryMaxImages(model);
     // Providers with a hard total-image cap budget against the remaining headroom
     // (client-attached images included) instead of subtracting from the history
@@ -235,8 +251,8 @@ function gptHistoryOpts(model, o, profile, existingImages = 0, forced = false) {
     return {
         ...o.gptHistory,
         reflow: o.gptHistory?.reflow ?? profile.history.reflow ?? o.reflow,
-        keepTail: o.gptHistory?.keepTail ?? profile.history.keepTail,
-        keepRecentPairs: o.gptHistory?.keepRecentPairs ?? profile.history.keepRecentPairs,
+        keepTail: Math.max(o.gptHistory?.keepTail ?? profile.history.keepTail ?? 0, floors.keepTail),
+        keepRecentPairs: Math.max(o.gptHistory?.keepRecentPairs ?? profile.history.keepRecentPairs ?? 0, floors.keepRecentPairs),
         // pxlite gate: same economics as the Claude path. Collapse only when the
         // collapsible text is large (>= PXLITE_GPT_MIN_COLLAPSE_TOKENS, ~25k net shrink)
         // and the prefix spans >= PXLITE_MIN_COLLAPSE_MESSAGES turns, so a warm cache is
@@ -745,7 +761,7 @@ async function applyChatHistoryCollapse(req, info, o, profile, protectedPrefix) 
     // messages (instead of also adding info.imageCount) avoids double-counting
     // the slab and matches the Responses path's budget math.
     const existingImages = countRequestImages(req.messages);
-    const plan = await planGptCollapse(chatMessagesToTurns(req.messages, { dropTools: true }), protectedPrefix, profitable, gptHistoryOpts(req.model, o, profile, existingImages, pxliteGptForced(req.messages, existingImages)));
+    const plan = await planGptCollapse(chatMessagesToTurns(req.messages, { dropTools: true }), protectedPrefix, profitable, gptHistoryOpts(req.model, o, profile, existingImages, pxliteGptForced(req.messages, existingImages), req.messages));
     foldGptHistory(info, req.model, plan);
     const allImages = [...plan.images, ...plan.imagesAfter];
     if (allImages.length === 0)
@@ -807,7 +823,7 @@ async function applyResponsesHistoryCollapse(req, inputItems, info, o, profile) 
         return accepted;
     };
     const existingImages = info.imageCount ?? 0;
-    const plan = await planResponsesPairCollapse(inputItems, profitable, gptHistoryOpts(req.model, o, profile, existingImages, pxliteGptForced(inputItems, existingImages)));
+    const plan = await planResponsesPairCollapse(inputItems, profitable, gptHistoryOpts(req.model, o, profile, existingImages, pxliteGptForced(inputItems, existingImages), inputItems));
     historySheets.beginEmission();
     const ps = plan.pairState;
     const rc = info.responsesComposition;

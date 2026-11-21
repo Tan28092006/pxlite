@@ -419,7 +419,7 @@ async function serve() {
   if (!disabled && !/^(0|false|no|off)$/i.test(process.env.PXLITE_TOOL_COLLAPSE ?? '')) {
     const { isPxpipeSupportedModel } = await core('applicability.js');
     const tc = createToolCollapse({
-      chunk: Number(process.env.PXLITE_TOOL_COLLAPSE_CHUNK ?? 100),
+      chunk: Number(process.env.PXLITE_TOOL_COLLAPSE_CHUNK ?? 50),
       keepTail: Number(process.env.PXLITE_TOOL_COLLAPSE_KEEP ?? 30),
       ttlMs: ttlMsOf(process.env.PXLITE_CACHE_TTL ?? '1h'),
     });

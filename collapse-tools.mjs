@@ -130,7 +130,7 @@ function patchPaths(a) {
 }
 
 export function createToolCollapse({
-  chunk = 100,
+  chunk = 50,
   keepTail = 30,
   minSave = 100,
   minGainChars = 40_000,

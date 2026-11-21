@@ -41,4 +41,18 @@ assert.ok(seen.baseline > 1000, 'gate sees raw baseline tokens, got ' + seen.bas
 assert.doesNotMatch(seen.text, /line of tool output/, 'imaged text has no tool output');
 assert.match(seen.text, /\[read\] \/f0\.js/);
 
+// Tail floors mirror Claude: 4 normally, 12 messages / 6 pairs inside a tool chain
+const O = await import(new URL('./vendor/pxpipe-proxy/dist/core/openai.js', import.meta.url).href);
+const calm = O.pxliteTailFloors([{ role: 'user', content: 'a' }, { role: 'assistant', content: 'b' }, { role: 'user', content: 'c' }]);
+assert.equal(calm.keepTail, 4);
+assert.equal(calm.keepRecentPairs, 4);
+const chainChat = O.pxliteTailFloors(chat);
+assert.equal(chainChat.keepTail, 12, 'chat tool chain keeps 12');
+const chainResp = O.pxliteTailFloors(items);
+assert.equal(chainResp.keepTail, 12);
+assert.equal(chainResp.keepRecentPairs, 6, 'responses chain keeps 6 pairs (12 items)');
+process.env.PXLITE_TOOL_ROUND_CUT = '0';
+assert.equal(O.pxliteTailFloors(chat).keepTail, 4, 'chain rule can be turned off');
+delete process.env.PXLITE_TOOL_ROUND_CUT;
+
 console.log('gpt history drop: ok');

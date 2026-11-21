@@ -35,7 +35,7 @@
     {
       "path": "dist/core/openai.js",
       "upstreamSha256": "514ec43ab6d17a37434ec866711ff31b684ae12b5865200029194c8045b37c5f",
-      "overlaySha256": "cf5bd78260c8bbf576d90de5b166e603033310b093ef4f930b319783e6c85f1a"
+      "overlaySha256": "6025521967cdc5c71162e2507d280d7306438abbd0b336152cce9e519cf1a088"
     },
     {
       "path": "dist/core/tracker.js",
