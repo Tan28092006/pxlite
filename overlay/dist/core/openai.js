@@ -214,7 +214,17 @@ function pxliteEnvInt(name, dflt) {
     const n = Number.parseInt(process.env[name] ?? '', 10);
     return Number.isFinite(n) && n >= 0 ? n : dflt;
 }
-function gptHistoryOpts(model, o, profile, existingImages = 0) {
+// Force-collapse: when estimated live context (chars/3 + ~1500 tokens per image) reaches
+// PXLITE_FORCE_COLLAPSE_TOKENS (default 250000, 0 disables), drop the message-count and
+// token-floor gates so a very long history with few messages still compresses.
+function pxliteGptForced(payload, imageCount) {
+    const limit = pxliteEnvInt('PXLITE_FORCE_COLLAPSE_TOKENS', 250000);
+    if (!limit) return false;
+    let chars = 0;
+    try { chars = JSON.stringify(payload).length; } catch { return false; }
+    return chars / 3 + (imageCount || 0) * 1500 >= limit;
+}
+function gptHistoryOpts(model, o, profile, existingImages = 0, forced = false) {
     const configuredMax = o.gptHistory?.maxImages ?? configuredHistoryMaxImages(model);
     // Providers with a hard total-image cap budget against the remaining headroom
     // (client-attached images included) instead of subtracting from the history
@@ -231,8 +241,8 @@ function gptHistoryOpts(model, o, profile, existingImages = 0) {
         // collapsible text is large (>= PXLITE_GPT_MIN_COLLAPSE_TOKENS, ~25k net shrink)
         // and the prefix spans >= PXLITE_MIN_COLLAPSE_MESSAGES turns, so a warm cache is
         // not rewritten for a small gain. Env can only raise the floor above the profile.
-        minCollapseTokens: Math.max(o.gptHistory?.minCollapseTokens ?? profile.history.minCollapseTokens ?? 0, pxliteEnvInt('PXLITE_GPT_MIN_COLLAPSE_TOKENS', 30000)),
-        minCollapsePrefix: Math.max(o.gptHistory?.minCollapsePrefix ?? profile.history.minCollapsePrefix ?? 0, pxliteEnvInt('PXLITE_MIN_COLLAPSE_MESSAGES', 50)),
+        minCollapseTokens: forced ? (o.gptHistory?.minCollapseTokens ?? profile.history.minCollapseTokens ?? 0) : Math.max(o.gptHistory?.minCollapseTokens ?? profile.history.minCollapseTokens ?? 0, pxliteEnvInt('PXLITE_GPT_MIN_COLLAPSE_TOKENS', 30000)),
+        minCollapsePrefix: forced ? (o.gptHistory?.minCollapsePrefix ?? profile.history.minCollapsePrefix ?? 0) : Math.max(o.gptHistory?.minCollapsePrefix ?? profile.history.minCollapsePrefix ?? 0, pxliteEnvInt('PXLITE_MIN_COLLAPSE_MESSAGES', 50)),
         ...(o.gptHistory?.collapseChunk !== undefined || profile.history.collapseChunk !== undefined
             ? { collapseChunk: o.gptHistory?.collapseChunk ?? profile.history.collapseChunk }
             : {}),
@@ -735,7 +745,7 @@ async function applyChatHistoryCollapse(req, info, o, profile, protectedPrefix) 
     // messages (instead of also adding info.imageCount) avoids double-counting
     // the slab and matches the Responses path's budget math.
     const existingImages = countRequestImages(req.messages);
-    const plan = await planGptCollapse(chatMessagesToTurns(req.messages), protectedPrefix, profitable, gptHistoryOpts(req.model, o, profile, existingImages));
+    const plan = await planGptCollapse(chatMessagesToTurns(req.messages), protectedPrefix, profitable, gptHistoryOpts(req.model, o, profile, existingImages, pxliteGptForced(req.messages, existingImages)));
     foldGptHistory(info, req.model, plan);
     const allImages = [...plan.images, ...plan.imagesAfter];
     if (allImages.length === 0)
@@ -797,7 +807,7 @@ async function applyResponsesHistoryCollapse(req, inputItems, info, o, profile) 
         return accepted;
     };
     const existingImages = info.imageCount ?? 0;
-    const plan = await planResponsesPairCollapse(inputItems, profitable, gptHistoryOpts(req.model, o, profile, existingImages));
+    const plan = await planResponsesPairCollapse(inputItems, profitable, gptHistoryOpts(req.model, o, profile, existingImages, pxliteGptForced(inputItems, existingImages)));
     historySheets.beginEmission();
     const ps = plan.pairState;
     const rc = info.responsesComposition;
