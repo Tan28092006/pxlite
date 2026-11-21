@@ -1,23 +1,136 @@
 {
-  "models": ["claude-fable-5", "claude-opus-5-5", "claude-sonnet-5-5", "gemini", "gpt-6.1-sol", "gpt-6.1-terra", "deepseek"],
+  "models": [
+    "claude-fable-5",
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
+    "gemini",
+    "gpt-6.1-sol",
+    "gpt-6.1-terra",
+    "gpt-6.1-astra",
+    "gpt-6-astra",
+    "gpt-6.2-astra",
+    "gpt-6.2-sol",
+    "deepseek"
+  ],
   "gptProfiles": {
     "gpt-6.1-sol": {
       "stripCols": 84,
       "maxHeightPx": 1954,
       "factSheetFormat": "full",
-      "style": { "font": "spleen-5x8", "cellWBonus": 0, "cellHBonus": 2, "aa": true, "grid": false, "gridCols": 0, "colorCycle": false, "markerScale": 1, "markerRed": false, "inkDilate": 0 }
+      "style": {
+        "font": "spleen-5x8",
+        "cellWBonus": 0,
+        "cellHBonus": 2,
+        "aa": true,
+        "grid": false,
+        "gridCols": 0,
+        "colorCycle": false,
+        "markerScale": 1,
+        "markerRed": false,
+        "inkDilate": 0
+      }
     },
     "gpt-6.1-terra": {
       "stripCols": 84,
       "maxHeightPx": 1954,
       "factSheetFormat": "full",
-      "style": { "font": "spleen-5x8", "cellWBonus": 0, "cellHBonus": 2, "aa": true, "grid": false, "gridCols": 0, "colorCycle": false, "markerScale": 1, "markerRed": false, "inkDilate": 0 }
+      "style": {
+        "font": "spleen-5x8",
+        "cellWBonus": 0,
+        "cellHBonus": 2,
+        "aa": true,
+        "grid": false,
+        "gridCols": 0,
+        "colorCycle": false,
+        "markerScale": 1,
+        "markerRed": false,
+        "inkDilate": 0
+      }
     },
     "deepseek": {
       "stripCols": 84,
       "maxHeightPx": 1954,
       "factSheetFormat": "full",
-      "style": { "font": "spleen-5x8", "cellWBonus": 0, "cellHBonus": 2, "aa": true, "grid": false, "gridCols": 0, "colorCycle": false, "markerScale": 1, "markerRed": false, "inkDilate": 0 }
+      "style": {
+        "font": "spleen-5x8",
+        "cellWBonus": 0,
+        "cellHBonus": 2,
+        "aa": true,
+        "grid": false,
+        "gridCols": 0,
+        "colorCycle": false,
+        "markerScale": 1,
+        "markerRed": false,
+        "inkDilate": 0
+      }
+    },
+    "gpt-6.2-sol": {
+      "stripCols": 84,
+      "maxHeightPx": 1954,
+      "factSheetFormat": "full",
+      "style": {
+        "font": "spleen-5x8",
+        "cellWBonus": 0,
+        "cellHBonus": 2,
+        "aa": true,
+        "grid": false,
+        "gridCols": 0,
+        "colorCycle": false,
+        "markerScale": 1,
+        "markerRed": false,
+        "inkDilate": 0
+      }
+    },
+    "gpt-6.2-astra": {
+      "stripCols": 84,
+      "maxHeightPx": 1954,
+      "factSheetFormat": "full",
+      "style": {
+        "font": "spleen-5x8",
+        "cellWBonus": 0,
+        "cellHBonus": 2,
+        "aa": true,
+        "grid": false,
+        "gridCols": 0,
+        "colorCycle": false,
+        "markerScale": 1,
+        "markerRed": false,
+        "inkDilate": 0
+      }
+    },
+    "gpt-6-astra": {
+      "stripCols": 84,
+      "maxHeightPx": 1954,
+      "factSheetFormat": "full",
+      "style": {
+        "font": "spleen-5x8",
+        "cellWBonus": 0,
+        "cellHBonus": 2,
+        "aa": true,
+        "grid": false,
+        "gridCols": 0,
+        "colorCycle": false,
+        "markerScale": 1,
+        "markerRed": false,
+        "inkDilate": 0
+      }
+    },
+    "gpt-6.1-astra": {
+      "stripCols": 84,
+      "maxHeightPx": 1954,
+      "factSheetFormat": "full",
+      "style": {
+        "font": "spleen-5x8",
+        "cellWBonus": 0,
+        "cellHBonus": 2,
+        "aa": true,
+        "grid": false,
+        "gridCols": 0,
+        "colorCycle": false,
+        "markerScale": 1,
+        "markerRed": false,
+        "inkDilate": 0
+      }
     }
   }
 }

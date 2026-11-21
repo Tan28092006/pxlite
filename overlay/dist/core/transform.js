@@ -315,6 +315,47 @@ export function isCompressionProfitableAmortized(text, cols, imageCountCap, char
         : 0;
     return imageLifetime + burnImageSide < textLifetime + burnTextSide;
 }
+/**
+ * Telemetry-wrapped history gate. Same decision as isCompressionProfitableAmortized,
+ * but it records, per request, what every evaluation priced: chars, estimated text
+ * tokens, estimated image tokens, the two lifetime costs, and the verdict. The totals
+ * land in the event log (`history_gate`) so the text-vs-image assumption (cpt, horizon)
+ * can be checked against the provider's real usage numbers.
+ *
+ * Horizon: PXLITE_HISTORY_HORIZON overrides; default 10. Measured over 17 collapsed
+ * sessions (4618 requests) the median session kept going 34 requests after its first
+ * collapse and p10 was 6, so 10 is a conservative lifetime to amortize the cache write.
+ */
+function makeHistoryGate(o, info, geometry, cpt, horizon) {
+    const envH = Number(process.env.PXLITE_HISTORY_HORIZON);
+    const N = Number.isFinite(envH) && envH >= 1 ? Math.floor(envH)
+        : (horizon > 1 ? horizon : 10);
+    const g = (info.historyGate = info.historyGate ?? {
+        horizon: N, calls: 0, accepted: 0, chars: 0, acceptedChars: 0,
+        textTokens: 0, imageTokens: 0, acceptedTextTokens: 0, acceptedImageTokens: 0,
+        lifetimeText: 0, lifetimeImage: 0,
+    });
+    return (text) => {
+        const ok = isCompressionProfitableAmortized(text, geometry.cols, undefined, cpt, N, o.priorWarmTokens, o.priorWarmImageTokens, true, geometry.maxChars, geometry);
+        if (typeof text === 'string' && text.length > 0) {
+            const imageTokens = imageTokensCost(text, geometry.cols, undefined, true, geometry.maxChars, geometry);
+            const textTokens = text.length / cpt;
+            g.calls++;
+            g.chars += text.length;
+            g.textTokens += textTokens;
+            g.imageTokens += imageTokens;
+            g.lifetimeText += textTokens * CACHE_READ_RATE * N;
+            g.lifetimeImage += imageTokens * (CACHE_CREATE_RATE + CACHE_READ_RATE * (N - 1));
+            if (ok) {
+                g.accepted++;
+                g.acceptedChars += text.length;
+                g.acceptedTextTokens += textTokens;
+                g.acceptedImageTokens += imageTokens;
+            }
+        }
+        return ok;
+    };
+}
 /** Increment a passthrough-reason counter on `info`. Lazily allocates `passthroughReasons`. */
 function bumpPassthrough(info, reason) {
     if (!info.passthroughReasons)
@@ -1781,10 +1822,7 @@ async function runHistoryCollapseAndFinalize(req, info, o, opts, droppedCodepoin
         // 2026-05-23 showed three-turn sessions paying cache_create every
         // turn because the history gate ignored priorWarmImageTokens.
         const historyGeometry = historyGateGeometry(o, opts.cols !== undefined);
-        const historyProfitable = (text, cols) => {
-            // Gate with the same model profile used by the history renderer.
-            return isCompressionProfitableAmortized(text, historyGeometry.cols, undefined, historyCpt, horizon, o.priorWarmTokens, o.priorWarmImageTokens, true, historyGeometry.maxChars, historyGeometry);
-        };
+        const historyProfitable = makeHistoryGate(o, info, historyGeometry, historyCpt, horizon);
         // The slab needs no shield here: this path runs only when the slab did NOT
         // image (it stays as text in req.system). But project instructions do.
         // CLAUDE.md arrives in the FIRST user message wrapped in <system-reminder>,
@@ -2440,10 +2478,7 @@ async function transformRequestInner(body, opts = {}) {
             : HISTORY_CHARS_PER_TOKEN;
         const horizon = Math.max(1, Math.floor(o.historyAmortizationHorizon));
         const historyGeometry = historyGateGeometry(o, opts.cols !== undefined);
-        const historyProfitable = (text, cols) => {
-            // Gate with the same model profile used by the history renderer.
-            return isCompressionProfitableAmortized(text, historyGeometry.cols, undefined, historyCpt, horizon, o.priorWarmTokens, o.priorWarmImageTokens, true, historyGeometry.maxChars, historyGeometry);
-        };
+        const historyProfitable = makeHistoryGate(o, info, historyGeometry, historyCpt, horizon);
         const slabAnchorIdx = (req.messages ?? []).findIndex((m) => m.role === 'user');
         const tuning = historyGridTuning(info);
         const { messages: newMessages, info: histInfo } = await collapseHistoryFitBytes(req.messages, historyProfitable, {

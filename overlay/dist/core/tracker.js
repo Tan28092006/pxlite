@@ -129,6 +129,17 @@ export function toTrackEvent(ev) {
             out.history_budget_trimmed = true;
         if (info.historyPackFill)
             out.history_pack_fill = true;
+        if (info.historyGate && info.historyGate.calls > 0) {
+            const g = info.historyGate;
+            const r = (x) => Math.round(x);
+            out.history_gate = {
+                horizon: g.horizon, calls: g.calls, accepted: g.accepted,
+                chars: g.chars, accepted_chars: g.acceptedChars,
+                est_text_tokens: r(g.textTokens), est_image_tokens: r(g.imageTokens),
+                accepted_text_tokens: r(g.acceptedTextTokens), accepted_image_tokens: r(g.acceptedImageTokens),
+                lifetime_text: r(g.lifetimeText), lifetime_image: r(g.lifetimeImage),
+            };
+        }
         if (info.droppedChars !== undefined && info.droppedChars > 0) {
             out.dropped_chars = info.droppedChars;
         }

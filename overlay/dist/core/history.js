@@ -59,7 +59,7 @@ export const HISTORY_DEFAULTS = {
  * clients serialize a parallel batch that way, so the apparently-closed gap
  * between two pairs is not a safe collapse boundary.
  */
-export function findClosedPrefixBoundary(messages, cutoffExclusive) {
+export function findClosedPrefixBoundary(messages, cutoffExclusive, relaxed = false) {
     if (cutoffExclusive <= 0)
         return -1;
     const openSet = new Set();
@@ -85,7 +85,7 @@ export function findClosedPrefixBoundary(messages, cutoffExclusive) {
             continue;
         }
         if (msg.role === 'assistant') {
-            if (assistantToolUses.length > 0)
+            if (assistantToolUses.length > 0 && !relaxed)
                 inToolRound = true;
             for (const blk of assistantToolUses) {
                 const id = blk.id;
@@ -108,7 +108,7 @@ export function findClosedPrefixBoundary(messages, cutoffExclusive) {
     // The end of a closed round is safe only if the actual next message does not
     // continue it with another serialized tool call. Looking one message past the
     // cutoff changes no collapsed index; it merely prevents splitting the round.
-    if (inToolRound && openSet.size === 0) {
+    if (!relaxed && inToolRound && openSet.size === 0) {
         const next = messages[limit];
         const nextContinuesRound = next?.role === 'assistant' &&
             Array.isArray(next.content) &&
@@ -635,11 +635,18 @@ export async function collapseHistory(messages, isProfitable, opts = {}) {
     // Snap the cutoff to a collapseChunk grid so the rendered PNG stays byte-identical
     // across turns and keeps hitting Anthropic's prompt cache. See docs/HISTORY_CACHE_MODEL.md.
     // Floor at minCollapsePrefix + protectedPrefix so short histories still collapse.
-    const rawCutoff = messages.length - o.keepTail;
+    // pxlite: inside a tool chain (tail holds tool_use/tool_result) keep a longer live tail
+    // and allow cutting between fully matched call/result pairs. An open tool_use still blocks.
+    const lastMsgs = messages.slice(-3);
+    const inChain = lastMsgs.some((m) => Array.isArray(m?.content) && m.content.some((b) => b && (b.type === 'tool_use' || b.type === 'tool_result')));
+    const chainKeep = Number.parseInt(process.env.PXLITE_TOOL_ROUND_KEEP_TAIL ?? '', 10);
+    const roundKeepTail = Number.isFinite(chainKeep) && chainKeep >= 0 ? chainKeep : 12;
+    const relaxedCut = inChain && process.env.PXLITE_TOOL_ROUND_CUT !== '0';
+    const rawCutoff = messages.length - (relaxedCut ? Math.max(o.keepTail, roundKeepTail) : o.keepTail);
     const cutoff = o.collapseChunk > 0
         ? Math.min(rawCutoff, Math.max(o.minCollapsePrefix + protectedPrefix, Math.floor(rawCutoff / o.collapseChunk) * o.collapseChunk))
         : rawCutoff;
-    const boundary = findClosedPrefixBoundary(messages, cutoff);
+    const boundary = findClosedPrefixBoundary(messages, cutoff, relaxedCut);
     if (boundary < 0) {
         info.reason = 'no_closed_prefix';
         return { messages, info };
@@ -689,7 +696,7 @@ export async function collapseHistory(messages, isProfitable, opts = {}) {
             acc += msgLen[k] + userImgLen[k];
             k++;
         }
-        const trimmedLen = findClosedPrefixBoundary(messages, protectedPrefix + k) + 1;
+        const trimmedLen = findClosedPrefixBoundary(messages, protectedPrefix + k, relaxedCut) + 1;
         if (trimmedLen - protectedPrefix < o.minCollapsePrefix) {
             info.reason = 'over_budget';
             return { messages, info };

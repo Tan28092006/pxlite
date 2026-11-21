@@ -109,3 +109,66 @@ test('history shrinking (compaction) resets state; no key = no-op; idempotent', 
   const small = convo(8);
   assert.doesNotThrow(() => tc.apply(small, { sessionKey: 'r' }));
 });
+
+// ---- OpenCode over OpenAI Chat Completions / Responses ----
+const BIG = 'x'.repeat(5000);
+function chatConvo(n) {
+  const m = [{ role: 'system', content: 'sys' }];
+  for (let i = 0; i < n; i++) {
+    m.push({ role: 'assistant', content: null, tool_calls: [{ id: `c${i}`, type: 'function', function: { name: i % 4 === 3 ? 'read' : i % 4 === 2 ? 'write' : 'bash', arguments: JSON.stringify({ filePath: 'a', content: BIG }) } }] });
+    m.push({ role: 'tool', tool_call_id: `c${i}`, content: i === 1 ? 'Error: boom\n' + BIG : BIG });
+  }
+  return { model: 'gpt-6.1-terra', messages: m };
+}
+function respConvo(n) {
+  const input = [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hi' }] }];
+  for (let i = 0; i < n; i++) {
+    const name = i % 4 === 3 ? 'read' : i % 4 === 2 ? 'write' : 'bash';
+    input.push({ type: 'function_call', call_id: `c${i}`, name, arguments: JSON.stringify({ content: BIG }) });
+    input.push({ type: 'function_call_output', call_id: `c${i}`, output: i === 1 ? 'Traceback (most recent call last)\n' + BIG : i === 4 ? [{ type: 'input_text', text: BIG }] : BIG });
+  }
+  return { model: 'gpt-6.1-terra', prompt_cache_key: 'ses_x', input };
+}
+
+test('chat completions: collapses old bash/write results, keeps read, errors and the tail', () => {
+  const tc = createToolCollapse({ keepTail: 10 });
+  const b = chatConvo(30);
+  assert.ok(tc.apply(b, { sessionKey: 's' }) > 0);
+  const tool = (i) => b.messages.find((m) => m.role === 'tool' && m.tool_call_id === `c${i}`);
+  assert.ok(tool(0).content.includes('pxlite: older output collapsed') && tool(0).content.length < 600);
+  assert.equal(tool(1).content.length, BIG.length + 12); // error kept whole
+  assert.equal(tool(3).content, BIG); // read never touched
+  assert.equal(tool(29).content, BIG); // inside keepTail
+  const w = b.messages.find((m) => m.tool_calls?.[0].id === 'c2').tool_calls[0].function.arguments;
+  assert.ok(JSON.parse(w).content.length < 800 && JSON.parse(w).filePath === 'a');
+  const before = JSON.stringify(b);
+  tc.apply(b, { sessionKey: 's' });
+  assert.equal(JSON.stringify(b), before); // idempotent
+});
+
+test('responses: collapses function_call_output (string and parts), keeps errors, read and tail', () => {
+  const tc = createToolCollapse({ keepTail: 10 });
+  const b = respConvo(30);
+  assert.ok(tc.apply(b, { sessionKey: 's' }) > 0);
+  const out = (i) => b.input.find((m) => m.type === 'function_call_output' && m.call_id === `c${i}`).output;
+  assert.ok(out(0).includes('pxlite: older output collapsed'));
+  assert.ok(out(4).includes('pxlite: older output collapsed')); // parts array
+  assert.ok(out(1).startsWith('Traceback')); // error kept
+  assert.equal(out(3), BIG);
+  assert.equal(out(29), BIG);
+  const w = b.input.find((m) => m.type === 'function_call' && m.call_id === 'c2').arguments;
+  assert.ok(JSON.parse(w).content.length < 800);
+});
+
+test('responses/chat: prefix before the boundary is byte-identical across requests (cache hits)', () => {
+  for (const mk of [chatConvo, respConvo]) {
+    const tc = createToolCollapse({ keepTail: 10, chunk: 100 });
+    const a = mk(30);
+    tc.apply(a, { sessionKey: 's' });
+    const b = mk(33);
+    tc.apply(b, { sessionKey: 's' });
+    const arr = (x) => x.messages ?? x.input;
+    const cut = Math.max(0, arr(a).length - 10) - 1;
+    assert.equal(JSON.stringify(arr(a).slice(0, cut)), JSON.stringify(arr(b).slice(0, cut)));
+  }
+});

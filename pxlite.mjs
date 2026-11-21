@@ -217,7 +217,7 @@ async function toWebRequest(req) {
       ? (req.url ?? '').replace(/^\/inference\/openai\/v1\/responses/, '/v1/responses')
       : req.url ?? '/';
   const url = `http://${req.headers.host ?? 'localhost'}${urlPath}`;
-  if (hasBody && (headers.has('content-encoding') || anthropicMessages || (responses && (DEBUG_SHAPE || recall)) || (openCodeChat && chatRecall) || (openCodeResponses && recall))) {
+  if (hasBody && (headers.has('content-encoding') || anthropicMessages || (responses && (DEBUG_SHAPE || recall)) || (openCodeChat && (chatRecall || claudeToolCollapse)) || (openCodeResponses && (recall || claudeToolCollapse)))) {
     const chunks = [];
     for await (const c of req) chunks.push(c);
     const raw = Buffer.concat(chunks);
@@ -282,6 +282,20 @@ async function toWebRequest(req) {
       } catch (err) {
         // Recall must never break a request: forward the original body.
         console.warn(`[pxlite] recall skipped: ${err.message}`);
+      }
+    }
+    // OpenCode over OpenAI Responses / Chat Completions: same tool-result collapse as the Messages
+    // branch. Runs after recall so recall snapshots keep the full, uncollapsed turn texts.
+    if ((openCodeChat || openCodeResponses) && claudeToolCollapse) {
+      try {
+        const parsed = JSON.parse(bytes.toString('utf8'));
+        const sid = headers.get('x-opencode-session-id') ?? parsed?.prompt_cache_key ?? headers.get('session_id') ?? headers.get('session-id');
+        if (claudeToolCollapse.apply(parsed, { sessionKey: sid ? `oc\u0000${sid}` : null }) > 0) {
+          bytes = Buffer.from(JSON.stringify(parsed));
+          headers.set('content-length', String(bytes.byteLength));
+        }
+      } catch (err) {
+        console.warn(`[pxlite] tool collapse (opencode) skipped: ${err.message}`);
       }
     }
     const request = new Request(url, { method, headers, body: bytes });
