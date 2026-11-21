@@ -28,6 +28,11 @@
       "overlaySha256": "c4b1532faeda75be61de863be5f490c7f751e05916a2d04f1ca7f4e693a758cf"
     },
     {
+      "path": "dist/core/openai.js",
+      "upstreamSha256": "514ec43ab6d17a37434ec866711ff31b684ae12b5865200029194c8045b37c5f",
+      "overlaySha256": "ceb4172929d8010541a63ecc0dffcf8dae116578273c9d28e4facc37dc50408d"
+    },
+    {
       "path": "dist/core/tracker.js",
       "upstreamSha256": "abd7c4176b2f5ff752a6921a84ce2ef137be900f86b234fb2013884bad801e5d",
       "overlaySha256": "cd23b152ab6ab875206e66372a47a11c2ed2d22885c691546189a87db82b845d"
