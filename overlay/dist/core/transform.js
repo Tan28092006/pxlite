@@ -1843,6 +1843,7 @@ async function runHistoryCollapseAndFinalize(req, info, o, opts, droppedCodepoin
             imageBudget: tuning.imageBudget,
             packFill: tuning.packFill,
             minFreezeStep: tuning.minFreezeStep,
+            priorWarmImageTokens: o.priorWarmImageTokens,
         }, info, o);
         recordFreezeStep(info.firstUserSha8, histInfo.freezeStep);
         if (histInfo.freezeStep !== undefined)
@@ -2491,6 +2492,7 @@ async function transformRequestInner(body, opts = {}) {
             imageBudget: tuning.imageBudget,
             packFill: tuning.packFill,
             minFreezeStep: tuning.minFreezeStep,
+            priorWarmImageTokens: o.priorWarmImageTokens,
         }, info, o);
         recordFreezeStep(info.firstUserSha8, histInfo.freezeStep);
         if (histInfo.freezeStep !== undefined)

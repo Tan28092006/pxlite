@@ -608,6 +608,39 @@ function latestCollapsedUserPointer(messages, upToExclusive, protectedPrefix) {
     }
     return undefined;
 }
+// pxlite: estimate how many prompt tokens a collapse removes, so tiny collapses (which only
+// burn the warm cache) can be skipped. See test-collapse-gate.mjs.
+const GATE_RENDERED_CPT = 2.0;   // rendered-history chars per text token (as transform.js)
+const GATE_IMG_RATIO = 0.148;    // measured image tokens / text tokens on collapsed history
+const GATE_RAW_CPT = 3.0;        // raw JSON-ish message chars per token
+function rawMessageChars(messages, from, to) {
+    let n = 0;
+    for (let i = from; i < to; i++) {
+        const c = messages[i]?.content;
+        if (typeof c === 'string') { n += c.length; continue; }
+        if (!Array.isArray(c)) continue;
+        for (const b of c) {
+            if (!b) continue;
+            if (b.type === 'text') n += (b.text ?? '').length;
+            else if (b.type === 'tool_use') n += JSON.stringify(b.input ?? {}).length + 40;
+            else if (b.type === 'tool_result') {
+                const x = b.content;
+                if (typeof x === 'string') n += x.length;
+                else if (Array.isArray(x)) for (const y of x) if (y && y.type === 'text') n += (y.text ?? '').length;
+            }
+        }
+    }
+    return n;
+}
+export function estimateCollapseShrinkTokens(messages, from, to, renderedChars, priorWarmImageTokens = 0) {
+    const raw = rawMessageChars(messages, from, to) / GATE_RAW_CPT;
+    const rendered = renderedChars / GATE_RENDERED_CPT;
+    if (rendered <= 0) return 0;
+    const k = Math.max(1, raw / rendered);                 // tool filtering gain
+    const priorRendered = Math.max(0, priorWarmImageTokens) / GATE_IMG_RATIO;
+    const newRendered = Math.max(0, rendered - priorRendered);
+    return Math.round(newRendered * k - newRendered * GATE_IMG_RATIO);
+}
 /**
  * Collapse the closed-prefix run into one synthetic user message with 1+ history images.
  * Returns original messages unchanged on any no-collapse path (reason set in info).
@@ -615,6 +648,11 @@ function latestCollapsedUserPointer(messages, upToExclusive, protectedPrefix) {
  */
 export async function collapseHistory(messages, isProfitable, opts = {}) {
     const o = { ...HISTORY_DEFAULTS, ...opts };
+    {   // pxlite: first collapse needs >= 50 messages (env), no more collapsing 14-message sessions
+        const envMin = Number.parseInt(process.env.PXLITE_MIN_COLLAPSE_MESSAGES ?? '50', 10);
+        if (opts.minCollapsePrefix === undefined && Number.isFinite(envMin) && envMin >= 0)
+            o.minCollapsePrefix = Math.max(o.minCollapsePrefix, envMin);
+    }
     const info = {
         collapsedTurns: 0,
         collapsedChars: 0,
@@ -710,6 +748,16 @@ export async function collapseHistory(messages, isProfitable, opts = {}) {
     if (!text || text.length === 0) {
         info.reason = 'render_empty';
         return { messages, info };
+    }
+    {   // pxlite: skip collapses that would remove too few prompt tokens (they only burn the warm cache)
+        const envShrink = Number.parseInt(process.env.PXLITE_MIN_SHRINK_TOKENS ?? '25000', 10);
+        const minShrink = opts.minShrinkTokens !== undefined ? opts.minShrinkTokens : (Number.isFinite(envShrink) ? envShrink : 25000);
+        const est = estimateCollapseShrinkTokens(messages, protectedPrefix, collapseLen, text.length, o.priorWarmImageTokens ?? 0);
+        info.estShrinkTokens = est;
+        if (minShrink > 0 && est < minShrink) {
+            info.reason = 'low_shrink';
+            return { messages, info };
+        }
     }
     // Reflow for RENDERING ONLY: pack short lines + mark hard breaks with ↵ so the
     // newline-heavy transcript fills full rows instead of one line per row. Same
