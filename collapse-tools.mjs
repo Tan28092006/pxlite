@@ -36,7 +36,7 @@ function stub(text, headChars, tailChars) {
 export function createToolCollapse({
   chunk = 100,
   keepTail = 30,
-  minSave = 500,
+  minSave = 200,
   minGainChars = 40_000,
   headChars = 300,
   tailChars = 150,
