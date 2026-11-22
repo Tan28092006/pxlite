@@ -1,7 +1,9 @@
 // Overflow override: context >= PXLITE_FORCE_COLLAPSE_TOKENS (180k) collapses even when
 // the normal gates (min messages, min shrink, profitability) would refuse.
 import assert from 'node:assert/strict';
+import test from 'node:test';
 import { collapseHistory } from './vendor/pxpipe-proxy/dist/core/history.js';
+import { GATE_ENV_OFF, withEnv } from './lib-test-env.mjs';
 
 const mk = (turns, chars) => {
   const m = [];
@@ -12,27 +14,29 @@ const mk = (turns, chars) => {
   return m;
 };
 const run = (m, profitable = () => true, o = {}) => collapseHistory(m, profitable, { collapseChunk: 0, keepTail: 4, ...o });
-delete process.env.PXLITE_FORCE_COLLAPSE_TOKENS;
-delete process.env.PXLITE_MIN_COLLAPSE_MESSAGES;
-delete process.env.PXLITE_MIN_SHRINK_TOKENS;
+const big = mk(20, 22000); // 40 msgs (< 50) but ~900k chars (~300k tokens)
 
-// 1. Small, short history: normal gates refuse.
-const small = await run(mk(8, 400));
-assert.ok(!(small.info.collapsedTurns > 0), 'small history must not collapse');
+test('small, short history: normal gates refuse', () =>
+  withEnv(GATE_ENV_OFF, async () => {
+    const small = await run(mk(8, 400));
+    assert.ok(!(small.info.collapsedTurns > 0), 'small history must not collapse');
+  }));
 
-// 2. 20 turns (40 msgs < 50) but ~900k chars (~300k tokens): forced.
-const big = mk(20, 22000);
-const forced = await run(big);
-assert.ok(forced.info.collapsedTurns > 0, 'over 180k tokens must collapse: ' + forced.info.reason);
-assert.equal(forced.info.forced, true);
+test('over 180k tokens with < 50 messages: forced collapse', () =>
+  withEnv(GATE_ENV_OFF, async () => {
+    const forced = await run(big);
+    assert.ok(forced.info.collapsedTurns > 0, 'over 180k tokens must collapse: ' + forced.info.reason);
+    assert.equal(forced.info.forced, true);
+  }));
 
-// 3. Same history, force disabled: refused by the 50-message gate.
-process.env.PXLITE_FORCE_COLLAPSE_TOKENS = '0';
-const off = await run(big);
-assert.ok(!(off.info.collapsedTurns > 0), 'force=0 restores normal gates: ' + off.info.reason);
+test('PXLITE_FORCE_COLLAPSE_TOKENS=0 disables force: 50-message gate applies', () =>
+  withEnv({ ...GATE_ENV_OFF, PXLITE_FORCE_COLLAPSE_TOKENS: 0 }, async () => {
+    const off = await run(big);
+    assert.ok(!(off.info.collapsedTurns > 0), 'force=0 restores normal gates: ' + off.info.reason);
+  }));
 
-// 4. Forced mode ignores the profitability callback.
-delete process.env.PXLITE_FORCE_COLLAPSE_TOKENS;
-const unprof = await run(big, () => false);
-assert.ok(unprof.info.collapsedTurns > 0, 'forced ignores not_profitable');
-console.log('ok');
+test('forced mode ignores the profitability callback', () =>
+  withEnv(GATE_ENV_OFF, async () => {
+    const unprof = await run(big, () => false);
+    assert.ok(unprof.info.collapsedTurns > 0, 'forced ignores not_profitable');
+  }));

@@ -47,6 +47,9 @@ export function toTrackEvent(ev) {
             out.compressed = info.compressed;
         if (info.reason)
             out.reason = info.reason;
+        // Only when set: the read-the-images reminder was appended to this request (see appendReadNote).
+        if (info.readNote)
+            out.read_note = true;
         if (info.origChars !== undefined)
             out.orig_chars = info.origChars;
         if (info.compressedChars !== undefined && info.compressedChars > 0) {
@@ -95,6 +98,8 @@ export function toTrackEvent(ev) {
         if (info.responsesComposition) {
             out.responses_composition = info.responsesComposition;
         }
+        if (info.gptCacheGate)
+            out.gpt_cache_gate = info.gptCacheGate;
         if (info.staticChars !== undefined)
             out.static_chars = info.staticChars;
         if (info.dynamicChars !== undefined)
@@ -129,6 +134,13 @@ export function toTrackEvent(ev) {
             out.history_budget_trimmed = true;
         if (info.historyPackFill)
             out.history_pack_fill = true;
+        if (info.historyTuning) {
+            out.history_tuning = {
+                cold: info.historyTuning.cold,
+                image_budget: info.historyTuning.imageBudget,
+                min_freeze_step: info.historyTuning.minFreezeStep,
+            };
+        }
         if (info.historyGate && info.historyGate.calls > 0) {
             const g = info.historyGate;
             const r = (x) => Math.round(x);
@@ -216,6 +228,10 @@ export function toTrackEvent(ev) {
             out.input_tokens = u.input_tokens;
         if (u.output_tokens !== undefined)
             out.output_tokens = u.output_tokens;
+        // A subset of output_tokens. Missing means unavailable, not zero.
+        // Never persist reasoning text or encrypted state.
+        if (u.reasoning_output_tokens !== undefined)
+            out.reasoning_output_tokens = u.reasoning_output_tokens;
         if (u.cache_creation_input_tokens !== undefined)
             out.cache_create_tokens = u.cache_creation_input_tokens;
         if (u.cache_read_input_tokens !== undefined)

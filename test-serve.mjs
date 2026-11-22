@@ -28,7 +28,7 @@ const freePort = () =>
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function startServe(t, extraEnv = {}) {
+async function startServe(t, extraEnv = {}, responseFixture) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'pxlite-serve-'));
   const home = path.join(tmp, 'home');
   fs.mkdirSync(home);
@@ -40,6 +40,18 @@ async function startServe(t, extraEnv = {}) {
   }
   fs.copyFileSync(path.join(HERE, 'config.default.json'), path.join(install, 'config.default.json'));
   fs.symlinkSync(path.join(HERE, 'vendor'), path.join(install, 'vendor'), 'junction');
+  // Intercept only the network destination. The real launcher still applies its
+  // host-specific compatibility code before this fixture receives the request.
+  const fetchFixture = path.join(tmp, 'offline-fetch.mjs');
+  fs.writeFileSync(fetchFixture, `
+    const nativeFetch = globalThis.fetch;
+    globalThis.fetch = (input, init) => {
+      const u = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+      if (u.hostname === 'api.openai.com' || u.hostname === 'chatgpt.com')
+        return nativeFetch(new URL(u.pathname + u.search, process.env.PXLITE_TEST_UPSTREAM), init);
+      return nativeFetch(input, init);
+    };
+  `);
 
   const seen = [];
   const upstream = http.createServer((req, res) => {
@@ -48,6 +60,7 @@ async function startServe(t, extraEnv = {}) {
     req.on('end', () => {
       const body = Buffer.concat(chunks).toString('utf8');
       seen.push({ method: req.method, url: req.url, body });
+      res.setHeader('x-request-id', `req_fixture_${seen.length}`);
       if (req.url.startsWith('/v1/messages')) {
         let stream = false;
         try {
@@ -56,6 +69,7 @@ async function startServe(t, extraEnv = {}) {
         return void answerMessages(res, stream);
       }
       res.setHeader('content-type', 'application/json');
+      if (responseFixture) return void res.end(JSON.stringify(responseFixture(JSON.parse(body), seen.length)));
       res.end(
         JSON.stringify({
           id: 'chatcmpl-test',
@@ -80,6 +94,8 @@ async function startServe(t, extraEnv = {}) {
     PXPIPE_MODELS: 'off',
     PXLITE_OPENCODE_UPSTREAM: `http://127.0.0.1:${upstreamPort}/inference/openai`,
     PXLITE_ANTHROPIC_UPSTREAM: `http://127.0.0.1:${upstreamPort}`,
+    PXLITE_TEST_UPSTREAM: `http://127.0.0.1:${upstreamPort}`,
+    NODE_OPTIONS: [process.env.NODE_OPTIONS, `--import=${pathToFileURL(fetchFixture).href}`].filter(Boolean).join(' '),
     ...extraEnv,
   };
   delete env.PXPIPE_LOG;
@@ -136,6 +152,24 @@ const readEvents = (home) => {
 
 const chatBody = JSON.stringify({ model: 'deepseek-v4.1-flash-free', messages: [{ role: 'user', content: 'hello opencode' }] });
 const headers = { 'content-type': 'application/json', authorization: 'Bearer test' };
+
+test('real GPT upstream event correlates headers and hashes cache identity without storing prompt text', { skip: SKIP }, async t => {
+  const { base, home } = await startServe(t, { PXPIPE_MODELS: 'gpt-6.1-sol' });
+  const res = await fetch(base + '/v1/responses', { method: 'POST',
+    headers: { ...headers, 'x-opencode-session-id': 'diagnostic-fixture' },
+    body: JSON.stringify({ model: 'gpt-6.1-sol', prompt_cache_key: 'PRIVATE-CACHE-KEY',
+      input: [{ role: 'user', content: 'PRIVATE-PROMPT-BODY' }] }) });
+  assert.equal(res.status, 200);
+  await res.text();
+  let events = [];
+  for (let i = 0; i < 50 && !events.length; i++) {
+    events = readEvents(home); if (!events.length) await sleep(100);
+  }
+  assert.equal(events[0]?.gpt_upstream?.request_id, 'req_fixture_1');
+  assert.equal(events[0].gpt_upstream.anchors, 0);
+  assert.match(events[0].gpt_upstream.cache_key_sha, /^[a-f0-9]{24}$/);
+  assert.ok(!JSON.stringify(events).includes('PRIVATE-'));
+});
 
 // Rules under test (pxlite.mjs claudeRequestTags):
 // - session_id: header x-claude-code-session-id, else metadata.user_id JSON .session_id; absent otherwise.
@@ -207,6 +241,199 @@ test('OpenCode Responses path goes to the OpenCode upstream too', { skip: SKIP }
   assert.match(seen[0].body, /hello responses/);
 });
 
+test('legacy GPT gate-off routes run tool checkpoints and hold old output bytes between epochs', { skip: SKIP }, async (t) => {
+  const { base, seen, home } = await startServe(t, {
+    PXLITE_RECALL: '0', PXPIPE_MODELS: 'gpt-6.1-sol', PXLITE_GPT_CACHE_GATE: '0',
+    PXLITE_GPT_CHECKPOINT_CHUNK: '50',
+  });
+  for (const route of ['/v1/responses', '/backend-api/codex/responses', '/v1/chat/completions']) {
+    const chat = route.endsWith('/chat/completions');
+    const make = n => {
+      const list = [{ role: 'user', content: chat ? 'run checks' : [{ type: 'input_text', text: 'run checks' }] }];
+      for (let i = 0; i < n; i++) list.push(...(chat ? [
+        { role: 'assistant', tool_calls: [{ id: `c${i}`, function: { name: 'shell', arguments: '{"command":"node check.mjs"}' } }] },
+        { role: 'tool', tool_call_id: `c${i}`, content: 'Build check passed.\n'.repeat(100) },
+      ] : [
+        { type: 'function_call', call_id: `c${i}`, name: 'shell', arguments: '{"command":"node check.mjs"}' },
+        { type: 'function_call_output', call_id: `c${i}`, output: 'Build check passed.\n'.repeat(100) },
+      ]));
+      return { model: 'gpt-6.1-sol', [chat ? 'messages' : 'input']: list };
+    };
+    const post = async n => {
+      const res = await fetch(base + route, { method: 'POST', headers: { ...headers, 'x-opencode-session-id': 'fixture-' + route }, body: JSON.stringify(make(n)) });
+      assert.equal(res.status, 200);
+      await res.text();
+      return JSON.parse(seen.at(-1).body)[chat ? 'messages' : 'input'];
+    };
+    const a = await post(40);
+    assert.ok(JSON.stringify(a).includes('pxlite: older output collapsed'), 'missing tool checkpoint on ' + route);
+    const b = await post(45);
+    assert.deepEqual(b.slice(0, a.length), a, 'old checkpoint bytes changed on ' + route);
+  }
+  let events = [];
+  for (let i = 0; i < 50; i++) {
+    events = readEvents(home).filter(e => e.model === 'gpt-6.1-sol');
+    if (events.length === 6) break;
+    await sleep(100);
+  }
+  assert.equal(events.length, 6);
+  assert.ok(events.every(e => e.tool_collapse?.has_key && e.tool_collapse.collapsed > 0));
+  assert.ok(events.every(e => e.gpt_history_checkpoint_chunk === 50));
+});
+
+test('managed GPT proxy logs the outgoing prefix and defers an unprofitable checkpoint atomically', { skip: SKIP }, async (t) => {
+  const { base, seen, home } = await startServe(t, {
+    PXLITE_RECALL: '0', PXPIPE_MODELS: 'gpt-6.1-sol', PXLITE_READ_NOTE: '0',
+    PXLITE_GPT_REASONING_MODE: 'native',
+    PXLITE_GPT_CHECKPOINT_CHUNK: '50',
+    PXLITE_GPT_MIN_COLLAPSE_TOKENS: '0', PXLITE_MIN_COLLAPSE_MESSAGES: '0',
+  }, () => ({ id: 'resp_fixture', object: 'response', model: 'gpt-6.1-sol',
+    output: [], status: 'completed', usage: { input_tokens: 100000, output_tokens: 2,
+      input_tokens_details: { cached_tokens: 95000 }, output_tokens_details: { reasoning_tokens: 1 } } }));
+  const make = n => ({ model: 'gpt-6.1-sol', input: [
+    { role: 'user', content: 'Inspect C:/project/main.js and complete the checks.' },
+    ...Array.from({ length: n }, (_, i) => [
+      { type: 'reasoning', id: `r${i}`, summary: [], encrypted_content: `PRIVATE_OPAQUE_${i}` },
+      { role: 'assistant', content: 'Inspect the source and preserve the relevant evidence. '.repeat(90) },
+      { type: 'function_call', call_id: `c${i}`, name: 'shell', arguments: '{"command":"node check.mjs"}' },
+      // Cold bootstrap must actually repay the configured 1.25x write premium.
+      { type: 'function_call_output', call_id: `c${i}`, output: 'Build passed.\n'.repeat(300) },
+    ]).flat(),
+  ] });
+  const post = async n => {
+    const res = await fetch(base + '/v1/responses', { method: 'POST',
+      headers: { ...headers, 'x-opencode-session-id': 'PRIVATE_MANAGED_SESSION' }, body: JSON.stringify(make(n)) });
+    assert.equal(res.status, 200);
+    await res.text();
+    return JSON.parse(seen.at(-1).body);
+  };
+   // A mature first frame has enough completed outputs to repay a cold write.
+   // A 50-item first frame is correctly rejected by the economic gate.
+   const a = await post(31);
+   const b = await post(33);
+  assert.deepEqual(b.input.slice(0, a.input.length), a.input);
+   const c = await post(45);
+  assert.deepEqual(c.input.slice(0, b.input.length), b.input);
+  let events = [];
+  for (let i = 0; i < 50; i++) {
+    events = readEvents(home).filter(e => e.model === 'gpt-6.1-sol');
+    if (events.length === 3) break;
+    await sleep(100);
+  }
+  assert.equal(events.length, 3);
+  assert.equal(events[0].gpt_prefix.status, 'first');
+  assert.equal(events[1].gpt_prefix.status, 'append_only');
+  assert.equal(events[2].gpt_prefix.status, 'append_only');
+  assert.equal(events[0].gpt_cache_gate.chosen_cutoff, 100,
+    JSON.stringify(events.map(e => e.gpt_cache_gate)));
+  assert.equal(events[2].gpt_cache_gate.candidate_cutoff, 150);
+  assert.equal(events[2].gpt_cache_gate.chosen_cutoff, 100);
+  assert.equal(events[2].gpt_cache_gate.accept, false);
+  assert.equal(events[2].gpt_cache_gate.reason, 'cache_payback');
+  assert.equal(events[1].reasoning_output_tokens, 1);
+  assert.ok(events.every(e => e.tool_collapse.mode === 'history_cache_gate'));
+  const raw = fs.readFileSync(path.join(home, '.pxpipe', 'events.jsonl'), 'utf8');
+  assert.ok(!raw.includes('PRIVATE_OPAQUE_'));
+  assert.ok(!raw.includes('PRIVATE_MANAGED_SESSION'));
+});
+
+test('summary GPT wire seals immutable pages and retains native tail without injected reminder', { skip: SKIP }, async t => {
+  const { base, seen, home } = await startServe(t, {
+    PXLITE_RECALL: '0', PXPIPE_MODELS: 'gpt-6.1-sol', PXLITE_READ_NOTE: undefined,
+    PXLITE_GPT_REASONING_MODE: 'summary', PXLITE_GPT_NATIVE_TAIL: '30',
+    PXLITE_GPT_CHECKPOINT_CHUNK: '50',
+  }, () => ({ id: 'resp_summary', object: 'response', output: [], status: 'completed',
+    usage: { input_tokens: 20000, output_tokens: 3, input_tokens_details: { cached_tokens: 19000 },
+      output_tokens_details: { reasoning_tokens: 2 } } }));
+  const make = n => ({ model: 'gpt-6.1-sol', input: [
+    { role: 'user', content: 'Implement and test the changes in C:/project/main.js.' },
+    ...Array.from({ length: n }, (_, i) => [
+      { type: 'reasoning', id: `rs_${i}`, summary: [{ type: 'summary_text', text: `PUBLIC_CHECK_${i}` }],
+        encrypted_content: `PRIVATE_STATE_${i}` },
+      { role: 'assistant', content: 'Check the implementation and preserve the verification result. '.repeat(20) },
+      { type: 'function_call', call_id: `c_${i}`, name: 'shell', arguments: '{"command":"node check.mjs"}' },
+      { type: 'function_call_output', call_id: `c_${i}`, output: 'Build passed.\n'.repeat(90) },
+    ]).flat(),
+  ] });
+  const post = async n => {
+    const res = await fetch(base + '/v1/responses', { method: 'POST',
+      headers: { ...headers, 'x-opencode-session-id': 'PRIVATE_SUMMARY_SESSION' },
+      body: JSON.stringify(make(n)) });
+    assert.equal(res.status, 200);
+    await res.text();
+    return JSON.parse(seen.at(-1).body);
+  };
+  const pages = b => b.input.filter(x => x.content?.some?.(p =>
+    p.type === 'input_text' && /^\[Earlier (turns|conversation)/.test(p.text ?? '')));
+  const a = await post(30), b = await post(32), c = await post(43);
+  assert.ok(pages(a).length > 0);
+  assert.deepEqual(pages(b), pages(a));
+  assert.deepEqual(pages(c).slice(0, pages(a).length), pages(a));
+  assert.ok(c.input.filter(x => x.type === 'reasoning').length < make(43).input.filter(x => x.type === 'reasoning').length);
+  assert.deepEqual(c.input.slice(-30), make(43).input.slice(-30));
+  assert.ok(!JSON.stringify(c).includes('Before answering, read every image'));
+  let events = [];
+  for (let i = 0; i < 50; i++) {
+    events = readEvents(home).filter(e => e.model === 'gpt-6.1-sol');
+    if (events.length === 3) break;
+    await sleep(100);
+  }
+  assert.equal(events.length, 3);
+  assert.ok(events.every(e => !e.read_note && e.gpt_cache_gate.history_mode === 'summary'));
+  assert.ok(events.every(e => e.gpt_cache_gate.native_tail_floor >= 30));
+  assert.equal(events[1].gpt_prefix.status, 'append_only');
+  assert.equal(events[1].gpt_cache_gate.history_reset, undefined);
+  assert.equal(events[2].reasoning_output_tokens, 2);
+  const raw = fs.readFileSync(path.join(home, '.pxpipe/events.jsonl'), 'utf8');
+  assert.ok(!raw.includes('PRIVATE_STATE_') && !raw.includes('PRIVATE_SUMMARY_SESSION'));
+});
+
+test('real serve strips unsupported Sol anchors without corrupting schemas', { skip: SKIP }, async (t) => {
+  const { base, seen } = await startServe(t);
+  const body = { model: 'gpt-6.1-sol', input: [{ role: 'user', content: [{ type: 'input_text', text: 'stable context',
+    prompt_cache_breakpoint: { mode: 'explicit' } }] }],
+    tools: [{ type: 'function', name: 'x', parameters: { type: 'object', properties: { prompt_cache_breakpoint: { type: 'string' } } } }] };
+  for (const route of ['/v1/responses', '/backend-api/codex/responses']) {
+    const res = await fetch(base + route, { method: 'POST', headers, body: JSON.stringify(body) });
+    assert.equal(res.status, 200);
+    await res.text();
+    const out = JSON.parse(seen.at(-1).body);
+    assert.equal(Boolean(out.input[0].content[0].prompt_cache_breakpoint), false);
+    assert.deepEqual(out.tools[0].parameters.properties.prompt_cache_breakpoint, { type: 'string' });
+  }
+});
+
+test('canonical GPT compaction keeps complete tool outputs and bypasses tool checkpoints', { skip: SKIP }, async (t) => {
+  const { base, seen, home } = await startServe(t, { PXLITE_RECALL: '0', PXPIPE_MODELS: 'gpt-6.1-sol' });
+  const input = [{ role: 'user', content: [{ type: 'input_text', text: 'previous task' }] }];
+  for (let i = 0; i < 40; i++) input.push(
+    { type: 'function_call', call_id: `s${i}`, name: 'shell', arguments: '{"command":"node check.mjs"}' },
+    { type: 'function_call_output', call_id: `s${i}`, output: 'Complete build output.\n'.repeat(100) },
+  );
+  const body = { model: 'gpt-6.1-sol', instructions: 'Your task is to create a detailed summary of this conversation.', input };
+  const res = await fetch(base + '/v1/responses', { method: 'POST',
+    headers: { ...headers, 'x-opencode-session-id': 'compact-fixture' }, body: JSON.stringify(body) });
+  assert.equal(res.status, 200);
+  await res.text();
+  assert.deepEqual(JSON.parse(seen.at(-1).body), body);
+  const evs = readEvents(home);
+  assert.ok(evs.every(e => !e.tool_collapse));
+});
+
+test('GPT history epochs remain enabled when tool-result collapse is disabled', { skip: SKIP }, async (t) => {
+  const { base, home } = await startServe(t, { PXLITE_RECALL: '0', PXLITE_TOOL_COLLAPSE: '0', PXPIPE_MODELS: 'gpt-6.1-sol' });
+  const res = await fetch(base + '/v1/responses', { method: 'POST',
+    headers: { ...headers, 'x-opencode-session-id': 'independent-history-fixture' },
+    body: JSON.stringify({ model: 'gpt-6.1-sol', input: [{ role: 'user', content: [{ type: 'input_text', text: 'hello' }] }] }),
+  });
+  assert.equal(res.status, 200);
+  await res.text();
+  let evs = [];
+  for (let i = 0; i < 50 && !evs.length; i++) { evs = readEvents(home); if (!evs.length) await sleep(100); }
+  assert.equal(evs[0]?.gpt_history_checkpoint_chunk, 130);
+  assert.ok(!evs[0].tool_collapse);
+});
+
 test('config.default.json: every GPT-wire model renders Spleen 5x8 with 2px rows', async () => {
   if (SKIP) return;
   const cfg = JSON.parse(fs.readFileSync(path.join(HERE, 'config.default.json'), 'utf8'));
@@ -243,10 +470,15 @@ function assertUserTexts(entry, want, name) {
   const blocks = got.join('\n').split('<browser_instruction>').length - 1;
   assert.equal(blocks, want.join('\n').split('<browser_instruction>').length - 1, `${name}: number of verbatim blocks`);
 }
+// A request that carries images (here: history rendered into pages) gets the read-the-images reminder as an
+// extra last text block (appendReadNote). It is pxlite's own block, not typed text, so it is left out of the
+// comparison; only a block equal to the note is dropped, any other stray text still fails the asserts.
+const { readNoteText } = await import(pathToFileURL(path.join(VENDOR, 'dist', 'core', 'transform.js')).href);
+const READ_NOTE = readNoteText();
 const upstreamUserTexts = (entry) =>
   JSON.parse(entry.body)
     .messages.filter((m) => m.role === 'user')
-    .map((m) => (typeof m.content === 'string' ? m.content : m.content.filter((b) => b.type === 'text').map((b) => b.text).join('|')));
+    .map((m) => (typeof m.content === 'string' ? m.content : m.content.filter((b) => b.type === 'text' && !(READ_NOTE && b.text === READ_NOTE)).map((b) => b.text).join('|')));
 
 async function postClaude(base, seen, sid, body) {
   const n = seen.length;

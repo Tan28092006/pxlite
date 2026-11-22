@@ -30,22 +30,22 @@
     {
       "path": "dist/core/openai-history.js",
       "upstreamSha256": "cb8bc0c34c817fe300fa74fd48f96e10c947536d1c933d83726cbf6925d682e5",
-      "overlaySha256": "038f840052dbcf999aab5cf5fabd0a7ae1f4e4f4102a8586d6336f971a64c8aa"
+      "overlaySha256": "564108b157262efbb349107dbcd8a19d772ce35bf639a022cfa92c6f2d8fc503"
     },
     {
       "path": "dist/core/openai.js",
       "upstreamSha256": "514ec43ab6d17a37434ec866711ff31b684ae12b5865200029194c8045b37c5f",
-      "overlaySha256": "c82d2969e84edafb9ef0c4047103de2f5f71d94c631199f6618f6734586bac54"
+      "overlaySha256": "cef2063ef46629b006e85b731069117514c4b5306c5822901a07b2b2d03e9d8f"
     },
     {
       "path": "dist/core/tracker.js",
       "upstreamSha256": "abd7c4176b2f5ff752a6921a84ce2ef137be900f86b234fb2013884bad801e5d",
-      "overlaySha256": "82dd50d7a3b94761c311fc27d171df7be1cb56c9cc3d6bad140c7ef1b72b1a11"
+      "overlaySha256": "fe05000d50180f4c3cfd52d09a556fe2a0a348a21ed72ea0f684e304279582b9"
     },
     {
       "path": "dist/core/transform.js",
       "upstreamSha256": "545fbcfc4ed6ebc5ff19d3cd503432967666127a474828496c1b2447f83dc8df",
-      "overlaySha256": "5682d08f8d10bfc877b92491c4eaf91fa3f274f93cd26fe580df3158e15532d0"
+      "overlaySha256": "e14e93f0e31a420d508786846dc3d877f0ede9d8d7de6905c79e2bb01709ef58"
     }
   ]
 }

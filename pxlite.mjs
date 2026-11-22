@@ -10,6 +10,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { analyze, applyScale } from './classify.mjs';
 import { RotatingLog } from './rotlog.mjs';
@@ -22,6 +23,9 @@ import { createToolCollapse, ttlMsOf } from './collapse-tools.mjs';
 import { listSessions, sessionInfo } from './recall-session.mjs';
 import { listOpenCodeSessions } from './recall-opencode-session.mjs';
 import { createRecallSessions } from './recall-sessions.mjs';
+import { createGptCachePolicy, toGptCacheSeedEvent } from './gpt-cache-policy.mjs';
+import { createGptPrefixTracker } from './gpt-prefix.mjs';
+import { describeGptUpstream, describeGptResponse } from './gpt-upstream-diagnostics.mjs';
 
 // Set by serve() when recall is enabled; used by toWebRequest on request bodies.
 let recall = null; // OpenCode, Responses
@@ -29,6 +33,8 @@ let claudeRecall = null; // Claude Code, Messages
 let chatRecall = null; // OpenCode providers on Chat Completions (opencode/*, e.g. deepseek)
 let claudeToolCollapse = null; // old successful Bash/Edit/Write results (collapse-tools.mjs)
 let claudeDedupe = null; // repeated injected blocks in Claude Messages (dedupe-blocks.mjs)
+let gptCachePolicy = null;
+const gptPrefixes = createGptPrefixTracker();
 
 // Per-request flags read by proxyConfig.transform(), which pxpipe calls with no
 // arguments inside the request's async context.
@@ -211,13 +217,15 @@ async function toWebRequest(req) {
   // request is rewritten to /v1/chat/completions and forwarded to the opencode base.
   const openCodeChat = method === 'POST' && /^\/inference\/openai\/v1\/chat\/completions(\?|$)/.test(req.url ?? '');
   const openCodeResponses = method === 'POST' && /^\/inference\/openai\/v1\/responses(\?|$)/.test(req.url ?? '');
+  const canonicalChat = method === 'POST' && /^\/v1\/chat\/completions(\?|$)/.test(req.url ?? '');
+  const gptWire = responses || canonicalChat || openCodeChat || openCodeResponses;
   const urlPath = openCodeChat
     ? (req.url ?? '').replace(/^\/inference\/openai\/v1\/chat\/completions/, '/v1/chat/completions')
     : openCodeResponses
       ? (req.url ?? '').replace(/^\/inference\/openai\/v1\/responses/, '/v1/responses')
       : req.url ?? '/';
   const url = `http://${req.headers.host ?? 'localhost'}${urlPath}`;
-  if (hasBody && (headers.has('content-encoding') || anthropicMessages || (responses && (DEBUG_SHAPE || recall)) || (openCodeChat && (chatRecall || claudeToolCollapse)) || (openCodeResponses && (recall || claudeToolCollapse)))) {
+  if (hasBody && (headers.has('content-encoding') || anthropicMessages || gptWire)) {
     const chunks = [];
     for await (const c of req) chunks.push(c);
     const raw = Buffer.concat(chunks);
@@ -227,7 +235,7 @@ async function toWebRequest(req) {
       headers.set('content-length', String(plain.byteLength));
     }
     let bytes = plain ?? raw;
-    const c = anthropicMessages ? classifyCompaction(bytes) : { compact: false, where: null };
+    const c = anthropicMessages || gptWire ? classifyCompaction(bytes) : { compact: false, where: null };
     let tags = null;
     if (anthropicMessages) {
       let parsed;
@@ -253,7 +261,10 @@ async function toWebRequest(req) {
       if (parsed && claudeToolCollapse && !c.compact) {
         try {
           const sessionKey = tags.session_id ? `${tags.session_id}\u0000${headers.get('x-claude-code-agent-id') ?? ''}` : null;
-          if (claudeToolCollapse.apply(parsed, { sessionKey }) > 0) {
+          const report = {};
+          const collapsed = claudeToolCollapse.apply(parsed, { sessionKey, report });
+          tags.tool_collapse = report;
+          if (collapsed > 0) {
             bytes = Buffer.from(JSON.stringify(parsed));
             headers.set('content-length', String(bytes.byteLength));
           }
@@ -284,13 +295,58 @@ async function toWebRequest(req) {
         console.warn(`[pxlite] recall skipped: ${err.message}`);
       }
     }
-    // OpenCode over OpenAI Responses / Chat Completions: same tool-result collapse as the Messages
-    // branch. Runs after recall so recall snapshots keep the full, uncollapsed turn texts.
-    if ((openCodeChat || openCodeResponses) && claudeToolCollapse) {
+    // All GPT wires, including canonical /v1 and Codex, not only opencode.ai.
+    // Runs after recall so snapshots keep full original tool results.
+    let gptHistory, gptPolicyRequest, gptPrefixContext;
+    if (gptWire && !c.compact) {
       try {
         const parsed = JSON.parse(bytes.toString('utf8'));
         const sid = headers.get('x-opencode-session-id') ?? parsed?.prompt_cache_key ?? headers.get('session_id') ?? headers.get('session-id');
-        if (claudeToolCollapse.apply(parsed, { sessionKey: sid ? `oc\u0000${sid}` : null }) > 0) {
+        const report = {};
+        const wire = Array.isArray(parsed?.input) ? 'responses' : 'chat';
+        const supportedGpt = /^(?:openai\/)?(?:gpt-|o\d)/i.test(parsed.model ?? '');
+        const configuredChunk = Number.parseInt(process.env.PXLITE_GPT_CHECKPOINT_CHUNK ?? '130', 10);
+        const checkpointChunk = Number.isFinite(configuredChunk) && configuredChunk >= 0 ? configuredChunk : 130;
+        const summaryMode = process.env.PXLITE_GPT_REASONING_MODE !== 'native';
+        const sourceKey = summaryMode && wire === 'responses'
+          ? createHash('sha256').update(JSON.stringify([
+            parsed.input.find(item => item?.role === 'user') ?? null,
+            parsed.instructions ?? null, parsed.tools ?? null,
+            parsed.input.length >= 8 ? parsed.input.slice(0, 8) : null,
+          ])).digest('hex') : undefined;
+        if (sid && supportedGpt) {
+          gptPrefixContext = { sessionKey: sourceKey ? `${sid}\u0000${sourceKey}` : sid, route: new URL(url).pathname };
+          if (wire === 'responses' && checkpointChunk > 1) gptPolicyRequest = gptCachePolicy?.forRequest({
+            sessionKey: sid, model: parsed.model, route: new URL(url).pathname,
+            ...(summaryMode ? { historyMode: 'summary', sourceKey } : {}) });
+        }
+        // A second, independently advancing destructive boundary would bypass the
+        // whole-prefix gate. Managed Responses fold old tools inside the selected
+        // history epoch instead. Claude/Chat retain their existing tool policy.
+        const collapsed = gptPolicyRequest ? 0 : claudeToolCollapse?.apply(parsed, { sessionKey: sid ? `oc\u0000${sid}\u0000${parsed.model ?? ''}\u0000${wire}` : null, report }) ?? 0;
+        if (gptPolicyRequest) Object.assign(report, { has_key: true,
+          n: parsed.input.length, boundary: gptPolicyRequest.cacheGate.heldCutoff ?? 0,
+          collapsed: 0, mode: 'history_cache_gate' });
+        if (claudeToolCollapse) tags = { ...tags, tool_collapse: report };
+        // Fixed input-item epochs for managed GPT sessions. Read/write accounting
+        // is not a clock: in particular, cache_write=0 does not mean cache is dead.
+        if (sid && supportedGpt) {
+          gptHistory = { checkpointChunk };
+          if (gptPolicyRequest && gptHistory.checkpointChunk > 1) {
+            Object.assign(gptHistory, { cacheGate: gptPolicyRequest.cacheGate,
+              preserveClientImages: true });
+            if (summaryMode) {
+              const tail = Number.parseInt(process.env.PXLITE_GPT_NATIVE_TAIL ?? '30', 10);
+              Object.assign(gptHistory, { reasoningMode: 'summary',
+                keepTail: Number.isFinite(tail) ? Math.max(30, tail) : 30 });
+            } else {
+              const keep = Number.parseInt(process.env.PXLITE_GPT_REASONING_KEEP ?? '50', 10);
+              gptHistory.reasoningKeep = Number.isFinite(keep) && keep >= 0 ? keep : 50;
+            }
+          }
+          tags = { ...tags, gpt_history_checkpoint_chunk: gptHistory.checkpointChunk };
+        }
+        if (collapsed > 0) {
           bytes = Buffer.from(JSON.stringify(parsed));
           headers.set('content-length', String(bytes.byteLength));
         }
@@ -302,6 +358,9 @@ async function toWebRequest(req) {
     request.pxliteCompact = c.compact;
     request.pxliteCompactWhere = c.where;
     request.pxliteTags = tags;
+    request.pxliteGptHistory = gptHistory;
+    request.pxliteGptPolicy = gptPolicyRequest;
+    request.pxliteGptPrefixContext = gptPrefixContext;
     if ((responses || openCodeResponses) && DEBUG_SHAPE) debugShape('in', req.url, plain ?? raw, headers);
     return request;
   }
@@ -384,6 +443,32 @@ function slimEvent(ev) {
   for (const k of Object.keys(ev)) if (k.startsWith('req_body_') && k !== 'req_body_sha8') delete ev[k];
   if (typeof ev.error_body === 'string' && ev.error_body.length > 400) ev.error_body = ev.error_body.slice(0, 400) + '…';
   return ev;
+}
+
+// Read only a bounded tail of numerical events. Never retain body samples,
+// messages, tool arguments, errors or credentials as statistical training data.
+function gptCacheSeed(file) {
+  let fd;
+  try {
+    fd = fs.openSync(file, 'r');
+    const size = fs.fstatSync(fd).size;
+    const start = Math.max(0, size - 2 * 1024 * 1024);
+    const data = Buffer.alloc(size - start);
+    fs.readSync(fd, data, 0, data.length, start);
+    const lines = data.toString('utf8').split('\n');
+    if (start) lines.shift();
+    return lines.slice(-4096).flatMap(line => {
+      let e;
+      try { e = JSON.parse(line); } catch { return []; }
+       const sample = toGptCacheSeedEvent(e);
+       return sample ? [sample] : [];
+    });
+  } catch (err) {
+    if (err.code !== 'ENOENT') console.warn(`[pxlite] cache statistics unavailable: ${err.code ?? 'read_error'}`);
+    return [];
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
 }
 
 async function serve() {
@@ -484,6 +569,10 @@ async function serve() {
   // Higher images more; 0 images everything, including numbers and JSON.
   const keepScale = Number(process.env.PXLITE_KEEP_SCALE ?? 1.5);
   applyScale(Number.isFinite(keepScale) ? keepScale : 1.5);
+  if (!disabled && !/^(0|false|no|off)$/i.test(process.env.PXLITE_GPT_CACHE_GATE ?? '')) {
+    gptCachePolicy = createGptCachePolicy({ events: gptCacheSeed(log.file),
+      ttlMs: ttlMsOf(process.env.PXLITE_CACHE_TTL ?? '1h') });
+  }
   const keepSharp = (block) => {
     const { reason } = analyze(block.text);
     if (reason) stats.keptText[reason] = (stats.keptText[reason] ?? 0) + 1;
@@ -494,7 +583,7 @@ async function serve() {
     transform: () => {
       if (disabled) return { compress: false };
       if (requestCtx.getStore()?.compact && !COMPACT_IMAGES) return { compress: false };
-      return { keepSharp };
+      return { keepSharp, gptHistory: requestCtx.getStore()?.gptHistory };
     },
     onRequest: (e) => {
       stats.requests += 1;
@@ -503,7 +592,9 @@ async function serve() {
         stats.imageBytes += e.info.imageBytes ?? 0;
       }
       try {
-        log.write(slimEvent({ ...toTrackEvent(e), ...requestCtx.getStore()?.tags }));
+        const row = { ...toTrackEvent(e), ...requestCtx.getStore()?.tags };
+        requestCtx.getStore()?.gptPolicy?.record(row);
+        log.write(slimEvent(row));
       } catch (err) {
         console.warn(`[pxlite] event log write failed: ${err.message}`);
       }
@@ -523,18 +614,34 @@ async function serve() {
   // rewritten to /v1/chat/completions in toWebRequest, so only the base differs.
   // PXLITE_OPENCODE_UPSTREAM exists so test-serve.mjs can point it at a local server.
   const handleOpenCode = createProxy({ ...proxyConfig, openAIUpstream: process.env.PXLITE_OPENCODE_UPSTREAM?.trim() || 'https://opencode.ai/inference/openai' });
-  // pxpipe's Sol profile marks an explicit `prompt_cache_breakpoint`; both the
-  // ChatGPT Codex backend and api.openai.com reject it for gpt-6.1-sol(-fast) with a
-  // 400. pxpipe calls the global fetch, so strip that key on Responses routes.
+  // Codex needs its measured compatibility fallback. Public OpenAI API models
+  // with explicit caching retain their anchors; never apply a global strip.
   const nativeFetch = globalThis.fetch;
   const RESPONSES = /^https:\/\/(chatgpt\.com\/backend-api\/codex|api\.openai\.com\/v1)\/responses/;
   globalThis.fetch = async (input, init) => {
     const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input?.url;
     if (init?.body && RESPONSES.test(url ?? '')) {
-      init = { ...init, body: stripCacheBreakpoints(init.body) };
+      init = { ...init, body: stripCacheBreakpoints(init.body, { url }) };
       if (DEBUG_SHAPE) debugShape('out', url, init.body, new Headers(init.headers));
     }
-    return nativeFetch(input, init);
+    const store = requestCtx.getStore();
+    if (init?.body && store?.gptPrefixContext && /\/(?:responses|chat\/completions)(?:\?|$)/.test(url ?? '')) {
+      try {
+        const json = typeof init.body === 'string' ? init.body : new TextDecoder().decode(init.body);
+        const report = gptPrefixes.observe(JSON.parse(json), {
+          ...store.gptPrefixContext, route: new URL(url).origin + new URL(url).pathname });
+        store.tags = { ...store.tags, gpt_prefix: report,
+          gpt_upstream: describeGptUpstream(url, json) };
+      } catch {
+        store.tags = { ...store.tags, gpt_prefix: { status: 'unknown', reason: 'invalid_body' } };
+      }
+    }
+    const response = await nativeFetch(input, init);
+    if (store?.tags?.gpt_upstream) {
+      try { store.tags = { ...store.tags,
+        gpt_upstream: { ...store.tags.gpt_upstream, ...describeGptResponse(response) } }; } catch {}
+    }
+    return response;
   };
   const pickHandler = (url) => (url?.startsWith('/backend-api/') ? handleChatGPT : url?.startsWith('/inference/openai/') ? handleOpenCode : handle);
 
@@ -603,7 +710,9 @@ async function serve() {
           stats.compactMarkerElsewhere[webReq.pxliteCompactWhere] = (stats.compactMarkerElsewhere[webReq.pxliteCompactWhere] ?? 0) + 1;
         }
         const handler = pickHandler(req.url);
-        await writeWebResponse(await requestCtx.run({ compact, tags: webReq.pxliteTags }, () => handler(webReq)), res);
+        await writeWebResponse(await requestCtx.run({ compact, tags: webReq.pxliteTags,
+          gptHistory: webReq.pxliteGptHistory, gptPolicy: webReq.pxliteGptPolicy,
+          gptPrefixContext: webReq.pxliteGptPrefixContext }, () => handler(webReq)), res);
       })
       .catch((err) => {
         console.error('[pxlite] handler error:', err);

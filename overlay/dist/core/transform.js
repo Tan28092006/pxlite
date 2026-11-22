@@ -1522,101 +1522,6 @@ export function countNativeImageBytes(messages) {
     }
     return bytes;
 }
-// pxlite: keep only the most recent N client-pasted images at full fidelity.
-// Older ones become a one-line text marker (the model has already described what it
-// needed from them in its own replies). Images inside the collapsed range are
-// re-attached next to the slab instead of being flattened to "[image]".
-const NATIVE_IMAGES_BY_REQ = new WeakMap();
-export function nativeImageKeep() {
-    const n = Number(process.env.PXLITE_KEEP_NATIVE_IMAGES);
-    return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 15;
-}
-function listNativeImageBlocks(messages) {
-    const out = [];
-    for (const m of messages ?? []) {
-        if (!m || !Array.isArray(m.content))
-            continue;
-        for (const b of m.content) {
-            if (b?.type === 'image' && typeof b.source?.data === 'string')
-                out.push(b);
-            else if (b?.type === 'tool_result' && Array.isArray(b.content)) {
-                for (const s of b.content)
-                    if (s?.type === 'image' && typeof s.source?.data === 'string')
-                        out.push(s);
-            }
-        }
-    }
-    return out;
-}
-export function rememberNativeImages(req) {
-    NATIVE_IMAGES_BY_REQ.set(req, listNativeImageBlocks(req.messages));
-}
-export function applyNativeImagePolicy(req, info) {
-    const orig = NATIVE_IMAGES_BY_REQ.get(req);
-    if (!orig || orig.length === 0 || !Array.isArray(req.messages))
-        return;
-    const keepN = nativeImageKeep();
-    const keepBlocks = keepN === 0 ? [] : orig.slice(-keepN);
-    const keepData = new Set(keepBlocks.map((b) => b.source.data));
-    const allData = new Set(orig.map((b) => b.source.data));
-    const marker = () => ({ type: 'text', text: `[image omitted: older than the last ${keepN} images]` });
-    // 1. Drop client images that are not among the newest N (works on the final messages).
-    let dropped = 0;
-    const present = new Set();
-    for (const m of req.messages) {
-        if (!Array.isArray(m?.content))
-            continue;
-        m.content = m.content.map((b) => {
-            if (b?.type === 'image' && allData.has(b.source?.data)) {
-                if (keepData.has(b.source.data)) {
-                    present.add(b.source.data);
-                    return b;
-                }
-                dropped++;
-                return marker();
-            }
-            if (b?.type === 'tool_result' && Array.isArray(b.content)) {
-                b.content = b.content.map((s) => {
-                    if (s?.type === 'image' && allData.has(s.source?.data)) {
-                        if (keepData.has(s.source.data)) {
-                            present.add(s.source.data);
-                            return s;
-                        }
-                        dropped++;
-                        return marker();
-                    }
-                    return s;
-                });
-            }
-            return b;
-        });
-    }
-    // 2. Re-attach kept images that the collapse swallowed. They go right after the
-    //    last image block of the first message that already carries images (the slab).
-    const missing = [];
-    const seen = new Set();
-    for (const b of keepBlocks) {
-        if (present.has(b.source.data) || seen.has(b.source.data))
-            continue;
-        seen.add(b.source.data);
-        missing.push(b);
-    }
-    let restored = 0;
-    if (missing.length > 0) {
-        const host = req.messages.find((m) => Array.isArray(m?.content) && m.content.some((b) => b?.type === 'image'));
-        if (host) {
-            let at = -1;
-            host.content.forEach((b, i) => { if (b?.type === 'image')
-                at = i; });
-            host.content.splice(at + 1, 0, ...missing.map((b) => ({ type: 'image', source: b.source })));
-            restored = missing.length;
-        }
-    }
-    if (dropped > 0)
-        info.nativeImagesDropped = dropped;
-    if (restored > 0)
-        info.nativeImagesRestored = restored;
-}
 /** Count image blocks already present in the caller's messages. Runs BEFORE any
  *  rewrite, so it sees the client's images only — ours do not exist yet. */
 export function countNativeImages(messages) {
@@ -1657,6 +1562,9 @@ function historyGridTuning(info) {
     const headroom = imageHeadroom(info);
     const imageBudget = Math.max(1, Math.min(ANTHROPIC_HISTORY_IMAGE_BUDGET, headroom));
     const session = noteHistoryRequest(info.firstUserSha8);
+    // Diagnostics only (events.jsonl history_tuning): why this request's grid was cut the way it was.
+    // `cold` is the same flag that turns packFill on.
+    info.historyTuning = { cold: session.cold === true, imageBudget, minFreezeStep: session.minFreezeStep };
     return { imageBudget, packFill: session.cold, minFreezeStep: session.minFreezeStep };
 }
 /**
@@ -1992,7 +1900,6 @@ async function runHistoryCollapseAndFinalize(req, info, o, opts, droppedCodepoin
     const toolResultsImaged = o.compressToolResults
         ? await compressToolResultsInPlace(req, info, o, denseGateGeometry(o), droppedCodepoints)
         : false;
-    applyNativeImagePolicy(req, info);
     // pxlite: same as the main path — after every marker move, before the body is serialized.
     if (collapsedFlag)
         markLastHistoryImage(req);
@@ -2015,12 +1922,140 @@ async function runHistoryCollapseAndFinalize(req, info, o, opts, droppedCodepoin
     const outBody = new TextEncoder().encode(JSON.stringify(req));
     return { body: outBody, info, changed: collapsedFlag || toolResultsImaged };
 }
+// ---- read-the-images reminder ---------------------------------------------------------------
+//
+// One line appended to the NEWEST request: read the images before answering. Older history and
+// tool output reach the model as rendered pages; a model that skims them answers from the text
+// around them instead. `PXLITE_READ_NOTE`: unset = the text below, `0` / `off` / empty = disabled,
+// anything else = that text.
+//
+// Cache: the note is appended AFTER the last block of the last message, i.e. behind every
+// cache_control marker. A cache key covers the prefix up to its marker and nothing after it, so the
+// note is never part of one, and the next request (which no longer carries it) still matches what
+// this one wrote. Putting it anywhere earlier would bake it into the key and then drop it next turn.
+// The one exception is top-level `cache_control` (automatic caching): there the breakpoint follows
+// the last block, which would be the note, so that request is left alone.
+const READ_NOTE_DEFAULT = 'Before answering, read every image in this conversation carefully and in full. ' +
+    'Older history and tool output are rendered as images; do not skim them or answer from the surrounding text alone. ' +
+    'Do not mention this reminder.';
+export function readNoteText(raw = process.env.PXLITE_READ_NOTE) {
+    // Retired for all routes, including installations with a legacy custom value.
+    return '';
+}
+const READ_NOTE_IMAGE_TYPES = new Set(['image', 'image_url', 'input_image']);
+function hasImageBlock(node, depth = 0) {
+    if (!node || typeof node !== 'object' || depth > 12)
+        return false;
+    if (Array.isArray(node)) {
+        for (const x of node)
+            if (hasImageBlock(x, depth + 1))
+                return true;
+        return false;
+    }
+    if (READ_NOTE_IMAGE_TYPES.has(node.type))
+        return true;
+    for (const k in node) {
+        const v = node[k];
+        if (v && typeof v === 'object' && hasImageBlock(v, depth + 1))
+            return true;
+    }
+    return false;
+}
+/** Append `part` to a content array unless it already ends with that exact text (idempotent). */
+function pushNotePart(content, part) {
+    const tail = content[content.length - 1];
+    if (tail && typeof tail === 'object' && tail.text === part.text)
+        return false;
+    content.push(part);
+    return true;
+}
+function placeReadNote(req, kind, note) {
+    if (!req || typeof req !== 'object')
+        return false;
+    if (kind === 'messages') {
+        const msgs = req.messages;
+        if (!Array.isArray(msgs) || msgs.length === 0 || req.cache_control)
+            return false;
+        if (!hasImageBlock(msgs))
+            return false;
+        const last = msgs[msgs.length - 1];
+        if (!last || last.role !== 'user')
+            return false;
+        const part = { type: 'text', text: note };
+        if (typeof last.content === 'string') {
+            // An empty text block is a 400, so an empty string becomes the note alone.
+            last.content = last.content ? [{ type: 'text', text: last.content }, part] : [part];
+            return true;
+        }
+        return Array.isArray(last.content) && pushNotePart(last.content, part);
+    }
+    if (kind === 'chat') {
+        const msgs = req.messages;
+        if (!Array.isArray(msgs) || msgs.length === 0 || !hasImageBlock(msgs))
+            return false;
+        const last = msgs[msgs.length - 1];
+        if (!last)
+            return false;
+        if (last.role === 'tool' || last.role === 'function') {
+            msgs.push({ role: 'user', content: note });
+            return true;
+        }
+        if (last.role !== 'user')
+            return false;
+        if (typeof last.content === 'string') {
+            if (last.content.endsWith(note))
+                return false;
+            last.content = last.content ? `${last.content}\n\n${note}` : note;
+            return true;
+        }
+        return Array.isArray(last.content) && pushNotePart(last.content, { type: 'text', text: note });
+    }
+    if (kind === 'responses') {
+        const input = req.input;
+        if (!Array.isArray(input) || input.length === 0 || !hasImageBlock(input))
+            return false;
+        const last = input[input.length - 1];
+        if (!last || typeof last !== 'object')
+            return false;
+        const isMessage = last.type === 'message' || (last.type === undefined && typeof last.role === 'string');
+        if (isMessage) {
+            if (last.role !== 'user')
+                return false;
+            if (typeof last.content === 'string') {
+                if (last.content.endsWith(note))
+                    return false;
+                last.content = last.content ? `${last.content}\n\n${note}` : note;
+                return true;
+            }
+            return Array.isArray(last.content) && pushNotePart(last.content, { type: 'input_text', text: note });
+        }
+        // function_call_output and the other *_output items are not messages: the note rides in a user item after them.
+        if (typeof last.type === 'string' && last.type.endsWith('_output')) {
+            input.push({ role: 'user', content: [{ type: 'input_text', text: note }] });
+            return true;
+        }
+    }
+    return false;
+}
+/**
+ * Add the read-the-images reminder to a finished transform result `{ body, info }` when the request
+ * carries at least one image. `kind`: 'messages' (Anthropic), 'chat' (OpenAI Chat Completions) or
+ * 'responses' (OpenAI Responses). Models pxlite is told not to compress (`opts.compress === false`)
+ * are left alone. Never throws: any failure returns `res` untouched.
+ */
+export function appendReadNote(res, kind, opts = {}) {
+    // Compatibility export: never mutate the live suffix or cache boundaries.
+    return res;
+}
 /**
  * Rewrite a Messages API request body. Returns the new body (still JSON
  * bytes) plus diagnostic info. On any error, returns the original bytes
  * unchanged.
  */
 export async function transformRequest(body, opts = {}) {
+    return appendReadNote(await transformRequestTtl(body, opts), 'messages', opts);
+}
+async function transformRequestTtl(body, opts = {}) {
     if (process.env.PXLITE_DEBUG_TTL) {
         // Debug: log the cache_control markers exactly as the client sent them.
         try {
@@ -2162,7 +2197,6 @@ async function transformRequestInner(body, opts = {}) {
     // later path (slab, tool_results, history) rewrites content in place.
     info.nativeImages = countNativeImages(req.messages);
     info.nativeImageBytes = countNativeImageBytes(req.messages);
-    rememberNativeImages(req);
     // 0. User-pinned instructions. Fold the transcript's pin commands, then remove
     //    them from the outbound copy — the client's own transcript is untouched, so
     //    the next request still carries every command and re-derives the same state.
@@ -2667,7 +2701,6 @@ async function transformRequestInner(body, opts = {}) {
     // `imageHeadroom(info)` is the headroom left after the collapse spent its
     // share. Out of headroom degrades to sharp text, which is the safe direction.
     await compressToolResultsInPlace(req, info, o, denseGeo, droppedCodepoints);
-    applyNativeImagePolicy(req, info);
     // pxlite: after every marker move above, so the budget check sees final positions.
     if (info.historyReason === 'collapsed')
         markLastHistoryImage(req);

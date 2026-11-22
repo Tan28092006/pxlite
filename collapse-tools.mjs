@@ -235,9 +235,15 @@ export function createToolCollapse({
     return found.length;
   }
 
-  /** Mutates body in place; returns how many blocks were collapsed. */
-  function apply(body, { sessionKey } = {}) {
+  /**
+   * Mutates body in place; returns how many blocks were collapsed.
+   * `report`, when given, is filled for the events log: has_key (a session key was supplied),
+   * n (items in the request), boundary (collapse checkpoint now, 0 = none) and collapsed
+   * (blocks collapsed this request).
+   */
+  function apply(body, { sessionKey, report } = {}) {
     const messages = Array.isArray(body?.messages) ? body.messages : Array.isArray(body?.input) ? body.input : null;
+    if (report) Object.assign(report, { has_key: Boolean(sessionKey), n: messages ? messages.length : 0, boundary: 0, collapsed: 0 });
     if (!sessionKey || !messages) return 0;
     const n = messages.length;
     const t = now();
@@ -258,7 +264,9 @@ export function createToolCollapse({
     sessions.delete(sessionKey);
     sessions.set(sessionKey, st);
     if (sessions.size > maxSessions) sessions.delete(sessions.keys().next().value);
-    return st.boundary > 0 ? collapseUpTo(messages, st.boundary) : 0;
+    const collapsed = st.boundary > 0 ? collapseUpTo(messages, st.boundary) : 0;
+    if (report) Object.assign(report, { boundary: st.boundary, collapsed });
+    return collapsed;
   }
   return { apply, sessionCount: () => sessions.size };
 }

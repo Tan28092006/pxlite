@@ -8,11 +8,11 @@
 import { renderTextToPngs, reflow, neutralizeSentinel, shrinkColsToContent, renderCellWidth, renderCellHeight, PAD_X, PAD_Y, READABLE_CHARS_PER_IMAGE, } from './render.js';
 import { resolveGptProfile, } from './gpt-model-profiles.js';
 import { bytesToBase64 } from './png.js';
-import { compactSlabWhitespace, countVisualRows, estimateImageCount, sha8, } from './transform.js';
+import { appendReadNote, compactSlabWhitespace, countVisualRows, estimateImageCount, sha8, } from './transform.js';
 import { visionTokens } from './vision-cost.js';
 import { computeOpenAICollapsePaybackReads } from './openai-savings.js';
 import { stripSchemaDescriptions } from './schema-strip.js';
-import { GPT_HISTORY_DEFAULTS, planGptCollapse, planResponsesPairCollapse, chatMessagesToTurns, isResponsesToolCall, isResponsesToolOutput, } from './openai-history.js';
+import { GPT_HISTORY_DEFAULTS, planGptCollapse, planResponsesPairCollapse, planResponsesSummaryCollapse, chatMessagesToTurns, isResponsesToolCall, isResponsesToolOutput, isRenderedGptContext, checkpointWindow, responsesReasoningPrune, } from './openai-history.js';
 import { HISTORY_SYNTHETIC_INTRO, HISTORY_SYNTHETIC_OUTRO } from './history.js';
 import { extractFactSheetTokens, factSheetText, prepareFactSheet } from './factsheet.js';
 import { relocateOpenAIPins } from './pin.js';
@@ -221,7 +221,14 @@ function pxliteGptForced(payload, imageCount) {
     const limit = pxliteEnvInt('PXLITE_FORCE_COLLAPSE_TOKENS', 180000);
     if (!limit) return false;
     let chars = 0;
-    try { chars = JSON.stringify(payload).length; } catch { return false; }
+    const textChars = value => typeof value === 'string' ? value.length
+        : Array.isArray(value) ? value.reduce((n, p) => n + (typeof p?.text === 'string' ? p.text.length : 0), 0) : 0;
+    for (const item of Array.isArray(payload) ? payload : []) {
+        if (item?.type === 'reasoning' || /compaction/.test(item?.type ?? '')) continue;
+        chars += textChars(item?.content) + textChars(item?.output);
+        if (typeof item?.arguments === 'string') chars += item.arguments.length;
+        for (const call of Array.isArray(item?.tool_calls) ? item.tool_calls : []) chars += textChars(call?.function?.arguments);
+    }
     return chars / 3 + (imageCount || 0) * 1500 >= limit;
 }
 // pxlite: tail floors that mirror the Claude path (history.js keepTail 4; 12 inside a tool chain).
@@ -232,7 +239,7 @@ export function pxliteTailFloors(items) {
     const chainEnv = Number.parseInt(process.env.PXLITE_TOOL_ROUND_KEEP_TAIL ?? '', 10);
     const chain = Number.isFinite(chainEnv) && chainEnv >= 0 ? chainEnv : 12;
     const last = Array.isArray(items) ? items.slice(-3) : [];
-    const inChain = process.env.PXLITE_TOOL_ROUND_CUT !== '0' && last.some((m) => m && (m.role === 'tool' || (Array.isArray(m.tool_calls) && m.tool_calls.length > 0) || m.type === 'function_call' || m.type === 'function_call_output'));
+    const inChain = process.env.PXLITE_TOOL_ROUND_CUT !== '0' && last.some((m) => m && (m.role === 'tool' || (Array.isArray(m.tool_calls) && m.tool_calls.length > 0) || isResponsesToolCall(m) || isResponsesToolOutput(m)));
     return {
         keepTail: inChain ? Math.max(base, chain) : base,
         // Responses counts call+output pairs: 2 items per pair
@@ -250,6 +257,9 @@ function gptHistoryOpts(model, o, profile, existingImages = 0, forced = false, i
         : Math.max(0, configuredMax - existingImages);
     return {
         ...o.gptHistory,
+        // Force may bootstrap a short, oversized context; it does not bypass an
+        // established checkpoint grid on every subsequent shell step.
+        checkpointBootstrap: forced,
         reflow: o.gptHistory?.reflow ?? profile.history.reflow ?? o.reflow,
         keepTail: Math.max(o.gptHistory?.keepTail ?? profile.history.keepTail ?? 0, floors.keepTail),
         keepRecentPairs: Math.max(o.gptHistory?.keepRecentPairs ?? profile.history.keepRecentPairs ?? 0, floors.keepRecentPairs),
@@ -263,6 +273,8 @@ function gptHistoryOpts(model, o, profile, existingImages = 0, forced = false, i
             ? { collapseChunk: o.gptHistory?.collapseChunk ?? profile.history.collapseChunk }
             : {}),
         freezeChunk: o.gptHistory?.freezeChunk ?? profile.history.freezeChunk ?? GPT_HISTORY_DEFAULTS.freezeChunk,
+        checkpointCutoff: o.gptHistory?.checkpointCutoff,
+        preserveClientImages: o.gptHistory?.preserveClientImages ?? !!o.gptHistory?.cacheGate,
         responsesMode: profile.history.responsesMode,
         cols: o.gptHistory?.cols ?? profile.stripCols,
         maxHeightPx: o.gptHistory?.maxHeightPx ?? profile.maxHeightPx,
@@ -552,12 +564,13 @@ function measureResponsesComposition(req, inputWasString, originalInputString, i
             c.imageParts += countImages(o.output);
         }
         else if (type === 'reasoning') {
-            // Includes encrypted_content when present; this is often a large Codex-native bucket.
-            c.reasoningEncrypted += gptTextTokens(JSON.stringify(o));
+            // Ciphertext length is NOT a provider input-token measurement.
+            c.reasoningItems = (c.reasoningItems ?? 0) + 1;
+            c.reasoningEncryptedChars = (c.reasoningEncryptedChars ?? 0) + (typeof o.encrypted_content === 'string' ? o.encrypted_content.length : 0);
         }
         else if (type === 'compaction' || type === 'compaction_trigger' ||
             type === 'context_compaction' || type === 'item_reference') {
-            c.compactionOpaque += gptTextTokens(JSON.stringify(o));
+            c.compactionOpaqueChars = (c.compactionOpaqueChars ?? 0) + (typeof o.encrypted_content === 'string' ? o.encrypted_content.length : 0);
         }
         else if (!role && type) {
             c.other += gptTextTokens(JSON.stringify(o));
@@ -686,6 +699,63 @@ function gptTextTokens(text) {
         return 0;
     }
 }
+/** Local estimate, not a model-specific official tokenizer. Opaque state is
+ * deliberately excluded; the host calibrates a shared offset from real usage. */
+export function estimateResponsesCacheTokens(req) {
+    let tokens = 0, opaqueItems = 0, unknownImages = 0, textFallbacks = 0, visibleTextChars = 0;
+    const text = value => {
+        if (typeof value !== 'string' || !value) return;
+        visibleTextChars += value.length;
+        try { tokens += o200kCountTokens(value); }
+        catch { tokens += Math.ceil(value.length / 3); textFallbacks++; }
+    };
+    const image = part => {
+        const url = typeof part.image_url === 'string' ? part.image_url
+            : part.image_url?.url ?? part.source?.data ?? '';
+        let w = 1024, h = 1024, known = false;
+        if (typeof url === 'string' && url.startsWith('data:image/png;base64,')) {
+            try {
+                const bytes = atob(url.slice(22, 66));
+                if (bytes.startsWith('\x89PNG\r\n\x1a\n') && bytes.length >= 24) {
+                    const u32 = i => ((bytes.charCodeAt(i) * 16777216) + (bytes.charCodeAt(i + 1) << 16)
+                        + (bytes.charCodeAt(i + 2) << 8) + bytes.charCodeAt(i + 3));
+                    const width = u32(16), height = u32(20);
+                    if (width > 0 && height > 0 && width <= 100000 && height <= 100000) {
+                        w = width; h = height; known = true;
+                    }
+                }
+            }
+            catch { /* Remote/non-PNG/invalid images use an explicitly marked estimate. */ }
+        }
+        if (!known) unknownImages++;
+        tokens += visionTokens(resolveGptProfile(req.model), w, h);
+    };
+    const parts = content => {
+        if (typeof content === 'string') { text(content); return; }
+        if (!Array.isArray(content)) return;
+        for (const part of content) {
+            if (!part || typeof part !== 'object') continue;
+            if (['input_image', 'image_url', 'image'].includes(part.type)) image(part);
+            else if (typeof part.text === 'string') text(part.text);
+        }
+    };
+    text(req.instructions);
+    if (Array.isArray(req.tools)) text(JSON.stringify(req.tools));
+    if (typeof req.input === 'string') text(req.input);
+    else if (Array.isArray(req.input)) for (const item of req.input) {
+        if (!item || typeof item !== 'object') continue;
+        // Never claim a saving from deleting opaque state, including guessed
+        // framing overhead. Its unmeasured usage offset is shared by both plans.
+        if (item.type === 'reasoning') { opaqueItems++; continue; }
+        tokens += 12;
+        if (isResponsesToolCall(item)) {
+            text(item.name); text(item.arguments); text(item.input);
+        }
+        else if (isResponsesToolOutput(item)) parts(item.output ?? item.content);
+        else parts(item.content);
+    }
+    return { tokens, opaqueItems, unknownImages, textFallbacks, visibleTextChars };
+}
 /** Vision-token cost of the rendered images, summed over their real dims —
  *  what GPT actually bills as input for the slab pxpipe imaged. */
 function gptImageTokens(model, images) {
@@ -756,12 +826,17 @@ function foldGptHistory(info, model, plan) {
 }
 async function applyChatHistoryCollapse(req, info, o, profile, protectedPrefix) {
     const profitable = (text, cols, baselineTextTokens) => evalOpenAIGate(req.model, text, cols, o.charsPerToken, baselineTextTokens).profitable;
+    // Chat collapses a contiguous prefix: protect rendered recall/system images,
+    // then permit ordinary old client screenshots to become history markers.
+    for (let i = protectedPrefix; i < req.messages.length; i++)
+        if (isRenderedGptContext(req.messages[i]))
+            protectedPrefix = i + 1;
     // Count images already in the request. At the main call site the static slab
     // images are inserted into req.messages before this runs, so walking the
     // messages (instead of also adding info.imageCount) avoids double-counting
     // the slab and matches the Responses path's budget math.
     const existingImages = countRequestImages(req.messages);
-    const plan = await planGptCollapse(chatMessagesToTurns(req.messages, { dropTools: true }), protectedPrefix, profitable, gptHistoryOpts(req.model, o, profile, existingImages, pxliteGptForced(req.messages, existingImages), req.messages));
+    const plan = await planGptCollapse(chatMessagesToTurns(req.messages, { dropTools: true, collapseImages: true }), protectedPrefix, profitable, gptHistoryOpts(req.model, o, profile, existingImages, pxliteGptForced(req.messages, existingImages), req.messages));
     foldGptHistory(info, req.model, plan);
     const allImages = [...plan.images, ...plan.imagesAfter];
     if (allImages.length === 0)
@@ -769,44 +844,217 @@ async function applyChatHistoryCollapse(req, info, o, profile, protectedPrefix) 
     const compactFraming = profile.history.framing === 'compact';
     const intro = compactFraming ? COMPACT_HISTORY_TRANSCRIPT_INTRO : HISTORY_TRANSCRIPT_INTRO;
     const outro = compactFraming ? COMPACT_HISTORY_TRANSCRIPT_OUTRO : HISTORY_TRANSCRIPT_OUTRO;
-    const histFactSheet = factSheetText(plan.text, profile.factSheetFormat);
-    const content = [{ type: 'text', text: intro }];
-    for (const img of plan.images)
-        content.push(openAIImagePart(img, req.model));
+    // A growing single message changes its old endpoint and moves a global
+    // fact-sheet. Emit each frozen source as its own stable native message.
+    const history = [];
+    let injected = '';
+    const appendGroups = (images, sources) => {
+        for (let i = 0; i < images.length;) {
+            const source = sources[i] ?? '';
+            const content = [{ type: 'text', text: intro }];
+            do {
+                content.push(openAIImagePart(images[i++], req.model));
+            } while (i < images.length && sources[i] === source);
+            const sheet = factSheetText(source, profile.factSheetFormat);
+            if (sheet)
+                content.push({ type: 'text', text: sheet });
+            content.push({ type: 'text', text: outro });
+            injected += intro + sheet + outro;
+            history.push({ role: 'user', content });
+        }
+    };
+    appendGroups(plan.images, plan.imageSources);
     if (plan.pinText !== undefined) {
-        content.push({ type: 'text', text: pinnedRequestBlock(plan.pinText) });
-        for (const img of plan.imagesAfter)
-            content.push(openAIImagePart(img, req.model));
+        history.push({ role: 'user', content: [{ type: 'text', text: pinnedRequestBlock(plan.pinText) }] });
+        appendGroups(plan.imagesAfter, plan.imageSourcesAfter);
     }
-    if (histFactSheet)
-        content.push({ type: 'text', text: histFactSheet });
-    content.push({ type: 'text', text: outro });
     const guard = buildLiveRequestGuard(plan.pinText);
     req.messages = [
         ...req.messages.slice(0, plan.start),
-        { role: 'user', content },
+        ...history,
         { role: 'developer', content: guard },
         ...req.messages.slice(plan.endExclusive),
     ];
     info.nativeInjectedTokens = (info.nativeInjectedTokens ?? 0)
-        + gptTextTokens(intro + histFactSheet + outro + guard);
+        + gptTextTokens(injected + guard);
     info.historyImageSha = await sha8(allImages.map((i) => bytesToBase64(i.png)).join(''));
     return true;
 }
-async function applyResponsesHistoryCollapse(req, inputItems, info, o, profile) {
+async function applyResponsesSummaryHistory(req, source, info, o, profile, slab) {
+    const gate = o.gptHistory?.cacheGate;
+    const renderHistorySheet = createHistoryFactSheetRenderer(profile).render;
+    const nativeImages = source.reduce((n, item) => n + [item.content, item.output]
+        .reduce((m, parts) => m + (Array.isArray(parts) ? parts.filter(p =>
+            p && ['input_image', 'image_url', 'image'].includes(p.type)).length : 0), 0), 0);
+    const current = gptHistoryOpts(req.model, o, profile,
+        (info.imageCount ?? 0) + nativeImages, false, source);
+    const historyOpts = { ...current, ...gate?.heldOptions,
+        reasoningMode: 'summary', checkpointBootstrap: false,
+        checkpointChunk: current.checkpointChunk,
+        // Projector upgrades are economic candidates, never silent changes to
+        // an already committed prefix. Missing persisted version means v1.
+        projectionVersion: current.projectionVersion ?? 5,
+        keepTail: Math.max(30, current.keepTail, gate?.heldOptions?.keepTail ?? 0),
+        maxImages: Math.min(current.maxImages, gate?.heldOptions?.maxImages ?? current.maxImages) };
+    const chunk = Math.floor(historyOpts.checkpointChunk ?? 130);
+    if (!Number.isFinite(chunk) || chunk <= 1) return false;
+    const available = Math.max(0, source.length - historyOpts.keepTail);
+    // Anchor upgrades to the last committed cutoff, not a new global grid:
+    // 1900 -> 2030, never 1900 -> 1950 after switching 50 to 130.
+    const anchor = Math.min(available, gate?.heldCutoff ?? 0);
+    const candidateCutoff = anchor + Math.floor((available - anchor) / chunk) * chunk;
+    if (candidateCutoff === gate?.heldCutoff && gate?.heldOptions?.checkpointChunk !== undefined)
+        historyOpts.checkpointChunk = gate.heldOptions.checkpointChunk;
+    const frame = (cutoff, options = historyOpts) => ({ ...options, checkpointCutoff: cutoff });
+    const profitable = (text, cols, baseline) =>
+        evalOpenAIGate(req.model, text, cols, o.charsPerToken, baseline).profitable;
+    const planAt = (cutoff, options) => planResponsesSummaryCollapse(source, profitable, frame(cutoff, options));
+    let plan = await planAt(candidateCutoff);
+    const failSafe = reason => {
+        info.historyReason = reason;
+        info.gptCacheGate = { history_mode: 'summary', accept: false, reason,
+            wire_applied: false, chosen_cutoff: gate?.heldCutoff ?? 0,
+            candidate_cutoff: candidateCutoff, source_items: source.length };
+        return false;
+    };
+    const unsafePlan = p => ['summary_image_budget', 'summary_native_reference'].includes(p.reason);
+    if (unsafePlan(plan)) return failSafe(plan.reason);
+    const materialize = p => {
+        const replacements = new Map(), removed = new Set(p.selectedIndices);
+        const compact = profile.history.framing === 'compact';
+        const intro = compact ? COMPACT_HISTORY_TRANSCRIPT_INTRO : HISTORY_TRANSCRIPT_INTRO;
+        const outro = compact ? COMPACT_HISTORY_TRANSCRIPT_OUTRO : HISTORY_TRANSCRIPT_OUTRO;
+        let injectedTokens = 0;
+        // Fact sheets are local to immutable pages, not a request-wide mutable sheet.
+        for (const segment of p.segments) {
+            if (!segment.images.length && !segment.text.trim()) continue;
+            const sheet = renderHistorySheet(segment.text);
+            const content = [{ type: 'input_text', text: intro },
+                ...segment.images.map(img => responsesImagePart(img, req.model)),
+                ...(sheet ? [{ type: 'input_text', text: sheet }] : []),
+                { type: 'input_text', text: outro, ...responsesCacheBreakpoint(req, profile) }];
+            const at = replacements.get(segment.insertAt) ?? [];
+            at.push({ role: 'user', content });
+            replacements.set(segment.insertAt, at);
+            injectedTokens += gptTextTokens(intro + sheet + outro);
+        }
+        const input = [], positions = [];
+        for (let i = 0; i < source.length; i++) {
+            positions[i] = input.length;
+            if (slab?.at === i) input.push(slab.item);
+            if (replacements.has(i)) input.push(...replacements.get(i));
+            if (!removed.has(i)) input.push(source[i]);
+        }
+        positions[source.length] = input.length;
+        // Autonomous tool loops still need the current user task as native text.
+        // This guard is a live suffix; it never edits a previously sealed page.
+        let latestUser = -1;
+        for (let i = 0; i < source.length; i++) if (source[i].role === 'user'
+            && !isRenderedGptContext(source[i])) latestUser = i;
+        if (removed.has(latestUser)) {
+            const text = responsesContentText(source[latestUser].content);
+            if (text) {
+                const guard = buildLiveRequestGuard(text);
+                input.push({ role: 'user', content: [{ type: 'input_text', text: guard }] });
+                injectedTokens += gptTextTokens(guard);
+            }
+        }
+        return { input, injectedTokens, positions };
+    };
+    let selected = materialize(plan);
+    const heldCutoff = Math.min(candidateCutoff, gate?.heldCutoff ?? 0);
+    const heldProjectionVersion = gate?.heldOptions?.projectionVersion ?? 1;
+    const heldPlan = heldCutoff === candidateCutoff && heldProjectionVersion === historyOpts.projectionVersion
+        && (gate?.heldOptions?.checkpointChunk ?? chunk) === chunk
+        ? plan : await planAt(heldCutoff, { ...historyOpts, ...gate?.heldOptions, projectionVersion: heldProjectionVersion });
+    if (unsafePlan(heldPlan)) return failSafe(heldPlan.reason);
+    const held = heldPlan === plan ? selected : materialize(heldPlan);
+    const candidateEstimate = estimateResponsesCacheTokens({ ...req, input: selected.input });
+    const heldEstimate = held === selected ? candidateEstimate
+        : estimateResponsesCacheTokens({ ...req, input: held.input });
+    const oldClosedThrough = Math.min(source.length,
+        gate?.heldClosedThrough ?? heldPlan.summaryState?.closedThrough ?? 0);
+    const replaySignature = await sha8(JSON.stringify(held.input.slice(0, held.positions[oldClosedThrough] ?? 0)));
+    const historyReset = !!gate?.heldSignature && gate.heldSignature !== replaySignature;
+    const candidatePrefixSignature = await sha8(JSON.stringify(
+        selected.input.slice(0, selected.positions[oldClosedThrough] ?? 0)));
+    const sealedPrefixPreserved = !historyReset && (gate?.heldSignature
+        ? gate.heldSignature === candidatePrefixSignature
+        : oldClosedThrough === 0);
+    let common = 0;
+    while (common < Math.min(held.input.length, selected.input.length)
+        && JSON.stringify(held.input[common]) === JSON.stringify(selected.input[common])) common++;
+    const preserved = historyReset ? 0
+        : estimateResponsesCacheTokens({ ...req, input: held.input.slice(0, common) }).tokens;
+    const newlyRemoved = Math.max(0, (plan.summaryState?.removed ?? 0) - (heldPlan.summaryState?.removed ?? 0));
+    const candidateDiagnostics = {
+        candidate_archived_pairs: plan.pairState?.collapsedPairs ?? 0,
+        candidate_native_pair_reasons: plan.summaryState?.nativeToolPairReasons ?? {},
+        candidate_history_images: plan.images.length,
+    };
+    const decision = gate?.evaluate ? gate.evaluate({
+        candidateCutoff, baselineTokens: heldEstimate.tokens, candidateTokens: candidateEstimate.tokens,
+        preservedPrefixTokens: preserved, reasoningRemoved: newlyRemoved, summaryMode: true,
+        savedTextChars: Math.max(0, heldEstimate.visibleTextChars - candidateEstimate.visibleTextChars),
+        baselineOpaqueItems: heldEstimate.opaqueItems, candidateOpaqueItems: candidateEstimate.opaqueItems,
+        sealedPrefixPreserved,
+        sameWire: JSON.stringify(held.input) === JSON.stringify(selected.input),
+        opaquePrefixChanged: newlyRemoved > 0, options: historyOpts, profile,
+    }) : { accept: true, chosen_cutoff: candidateCutoff, history_mode: 'summary' };
+    if (!decision.accept) { plan = heldPlan; selected = held; }
+    const estimate = decision.accept ? candidateEstimate : heldEstimate;
+    const closedThrough = plan.summaryState?.closedThrough ?? 0;
+    const closedSignature = await sha8(JSON.stringify(selected.input.slice(0, selected.positions[closedThrough] ?? 0)));
+    info.gptCacheGate = { ...decision, history_mode: 'summary', wire_applied: true,
+        ...(historyReset ? { history_reset: true, economic_reason: decision.reason,
+            reason: 'archive_source_or_dependency_changed' } : {}),
+        closed_prefix_signature: closedSignature,
+        candidate_cutoff: candidateCutoff, source_items: source.length,
+        native_tail_floor: historyOpts.keepTail,
+        closed_through: closedThrough,
+        reasoning_removed: plan.summaryState?.removed ?? 0,
+        reasoning_summaries: plan.summaryState?.summaries ?? 0,
+        reasoning_protected: plan.summaryState?.protected ?? 0,
+        candidate_reasoning_removed: newlyRemoved,
+        ...candidateDiagnostics,
+        deferred_epochs: decision.accept ? 0 : Math.max(0, Math.floor((candidateCutoff - heldCutoff) / chunk)),
+        opaque_items: estimate.opaqueItems, unknown_image_dimensions: estimate.unknownImages,
+        text_fallbacks: estimate.textFallbacks };
+    const ps = plan.pairState;
+    if (ps && info.responsesComposition) {
+        const rc = info.responsesComposition;
+        Object.assign(rc, { completedFunctionPairs: ps.completedPairs,
+            recentNativeFunctionPairs: ps.recentCompletedPairs, oldFunctionPairs: ps.oldCompletedPairs,
+            openFunctionCalls: ps.openCalls, orphanFunctionOutputs: ps.orphanOutputs,
+            malformedFunctionItems: ps.malformedItems, collapsedFunctionPairs: ps.collapsedPairs,
+            collapsedFunctionCalls: ps.collapsedFunctionCallTokens,
+            collapsedFunctionOutputs: ps.collapsedFunctionOutputTokens,
+            nativeFunctionPairReasons: plan.summaryState?.nativeToolPairReasons ?? {} });
+    }
+    foldGptHistory(info, req.model, plan);
+    if (!plan.images.length && plan.selectedIndices.length) {
+        info.historyReason = 'summary_checkpoint_no_images';
+        info.collapsedTurns = plan.selectedIndices.length;
+    }
+    req.input = selected.input;
+    info.nativeInjectedTokens = (info.nativeInjectedTokens ?? 0) + selected.injectedTokens;
+    if (plan.images.length) info.historyImageSha = await sha8(plan.images.map(img => bytesToBase64(img.png)).join(''));
+    return plan.selectedIndices.length > 0;
+}
+async function applyResponsesHistoryCollapse(req, inputItems, info, o, profile, summarySource) {
+    if (o.gptHistory?.reasoningMode === 'summary')
+        return applyResponsesSummaryHistory(req, summarySource?.items ?? inputItems, info, o, profile, summarySource?.slab);
     const historySheets = createHistoryFactSheetRenderer(profile);
     const renderHistorySheet = historySheets.render;
     // Match emission's prefix-local deduplication. Only accepted sections cover
     // spellings; rejected sections must not make a later replacement look cheaper.
     const plannedSheetTokens = profile.history.factSheetOverflow === 'native-opaque'
-        && profile.history.factSheetScope === 'per-segment' ? new Set() : undefined;
+        ? new Set() : undefined;
     const profitable = (text, cols, baselineTextTokens, sourceText = text) => {
         const gate = evalOpenAIGate(req.model, text, cols, o.charsPerToken, baselineTextTokens);
         if (!gate.profitable)
             return false;
         const maxReads = profile.history.maxCachePaybackReads;
-        if (!profile.history.factSheetOverflow && maxReads === undefined)
-            return true;
         const framing = profile.history.framing === 'compact'
             ? COMPACT_HISTORY_TRANSCRIPT_INTRO + COMPACT_HISTORY_TRANSCRIPT_OUTRO
             : HISTORY_TRANSCRIPT_INTRO + HISTORY_TRANSCRIPT_OUTRO;
@@ -823,8 +1071,85 @@ async function applyResponsesHistoryCollapse(req, inputItems, info, o, profile) 
         return accepted;
     };
     const existingImages = info.imageCount ?? 0;
-    const plan = await planResponsesPairCollapse(inputItems, profitable, gptHistoryOpts(req.model, o, profile, existingImages, pxliteGptForced(inputItems, existingImages), inputItems));
-    historySheets.beginEmission();
+    const gate = o.gptHistory?.cacheGate;
+    const currentOpts = gptHistoryOpts(req.model, o, profile, existingImages, pxliteGptForced(inputItems, existingImages), inputItems);
+    // Freeze planning floors and reader geometry, not merely the numeric cutoff.
+    // A larger live tail must not image previously native history in the same epoch.
+    const historyOpts = { ...currentOpts, ...gate?.heldOptions,
+        maxImages: Math.min(currentOpts.maxImages, gate?.heldOptions?.maxImages ?? currentOpts.maxImages) };
+    const candidateFrame = checkpointWindow(inputItems.length, historyOpts);
+    const planAt = async opts => {
+        plannedSheetTokens?.clear();
+        return planResponsesPairCollapse(inputItems, profitable, opts);
+    };
+    let plan = await planAt(historyOpts);
+    const materialize = (selectedPlan, frame) => {
+        historySheets.beginEmission();
+        const replacements = new Map();
+        const compact = profile.history.framing === 'compact';
+        const intro = compact ? COMPACT_HISTORY_TRANSCRIPT_INTRO : HISTORY_TRANSCRIPT_INTRO;
+        const outro = compact ? COMPACT_HISTORY_TRANSCRIPT_OUTRO : HISTORY_TRANSCRIPT_OUTRO;
+        const covered = profile.history.factSheetOverflow === 'native-opaque' ? new Set() : undefined;
+        let injectedTokens = 0;
+        for (const segment of selectedPlan.segments) {
+            const content = [{ type: 'input_text', text: intro },
+                ...segment.images.map(img => responsesImagePart(img, req.model))];
+            const sheet = renderHistorySheet(segment.text, covered);
+            if (sheet) {
+                content.push({ type: 'input_text', text: sheet });
+                if (covered) for (const token of extractFactSheetTokens(sheet)) covered.add(token);
+            }
+            content.push({ type: 'input_text', text: outro, ...responsesCacheBreakpoint(req, profile) });
+            injectedTokens += gptTextTokens(intro + sheet + outro);
+            replacements.set(segment.insertAt, { role: 'user', content });
+        }
+        const pruning = gate && Number.isFinite(o.gptHistory?.reasoningKeep)
+            ? responsesReasoningPrune(inputItems, frame, o.gptHistory.reasoningKeep)
+            : { removed: [], kept: 0, protected: 0 };
+        const removed = new Set([...selectedPlan.selectedIndices, ...pruning.removed]);
+        const input = [];
+        for (let i = 0; i < inputItems.length; i++) {
+            const replacement = replacements.get(i);
+            if (replacement) input.push(replacement);
+            if (!removed.has(i)) input.push(inputItems[i]);
+        }
+        return { input, injectedTokens, pruning };
+    };
+    let selected = materialize(plan, candidateFrame);
+    if (gate?.evaluate && candidateFrame.managed) {
+        const heldOpts = { ...historyOpts, checkpointCutoff: gate.heldCutoff ?? 0 };
+        const heldFrame = checkpointWindow(inputItems.length, heldOpts);
+        const heldPlan = heldFrame.cutoff === candidateFrame.cutoff ? plan : await planAt(heldOpts);
+        const held = heldPlan === plan ? selected : materialize(heldPlan, heldFrame);
+        const candidateEstimate = estimateResponsesCacheTokens({ ...req, input: selected.input });
+        const heldEstimate = held === selected ? candidateEstimate
+            : estimateResponsesCacheTokens({ ...req, input: held.input });
+        const decision = gate.evaluate({
+            candidateCutoff: candidateFrame.cutoff,
+            baselineTokens: heldEstimate.tokens,
+            candidateTokens: candidateEstimate.tokens,
+            savedTextChars: Math.max(0, heldEstimate.visibleTextChars - candidateEstimate.visibleTextChars),
+            sameWire: JSON.stringify(held.input) === JSON.stringify(selected.input),
+            opaquePrefixChanged: selected.pruning.removed.length > held.pruning.removed.length,
+            options: historyOpts,
+            profile,
+        });
+        if (!decision.accept) { plan = heldPlan; selected = held; }
+        const estimate = decision.accept ? candidateEstimate : heldEstimate;
+        info.gptCacheGate = { ...decision,
+            candidate_reasoning_removed: candidateFrame.cutoff === heldFrame.cutoff
+                ? selected.pruning.removed.length
+                : responsesReasoningPrune(inputItems, candidateFrame, o.gptHistory?.reasoningKeep ?? 50).removed.length,
+            deferred_epochs: decision.accept ? 0 : Math.max(0, Math.floor(
+                (candidateFrame.cutoff - (gate.heldCutoff ?? 0)) / Math.max(1, historyOpts.checkpointChunk))),
+            reasoning_removed: selected.pruning.removed.length,
+            reasoning_kept_at_checkpoint: selected.pruning.kept,
+            reasoning_protected: selected.pruning.protected,
+            opaque_items: estimate.opaqueItems,
+            unknown_image_dimensions: estimate.unknownImages,
+            text_fallbacks: estimate.textFallbacks,
+        };
+    }
     const ps = plan.pairState;
     const rc = info.responsesComposition;
     rc.completedFunctionPairs = ps.completedPairs;
@@ -847,51 +1172,10 @@ async function applyResponsesHistoryCollapse(req, inputItems, info, o, profile) 
             .map(([type, count]) => `${type}:${count}`);
     }
     foldGptHistory(info, req.model, plan);
-    if (plan.segments.length === 0)
+    req.input = selected.input;
+    info.nativeInjectedTokens = (info.nativeInjectedTokens ?? 0) + selected.injectedTokens;
+    if (plan.segments.length === 0 && selected.pruning.removed.length === 0)
         return false;
-    const replacements = new Map();
-    const compactFraming = profile.history.framing === 'compact';
-    const intro = compactFraming ? COMPACT_HISTORY_TRANSCRIPT_INTRO : HISTORY_TRANSCRIPT_INTRO;
-    const outro = compactFraming ? COMPACT_HISTORY_TRANSCRIPT_OUTRO : HISTORY_TRANSCRIPT_OUTRO;
-    const combinedSheet = profile.history.factSheetScope === 'combined'
-        ? renderHistorySheet(plan.text)
-        : '';
-    // Request-local and emission-ordered: a skipped/referenced/unimaged group
-    // cannot cover a spelling. Use a fresh set to replay the same accepted-prefix
-    // coverage used by planning; appended groups keep old prefixes.
-    const coveredSheetTokens = profile.history.factSheetOverflow === 'native-opaque'
-        ? new Set() : undefined;
-    for (let segmentIndex = 0; segmentIndex < plan.segments.length; segmentIndex++) {
-        const segment = plan.segments[segmentIndex];
-        const content = [
-            { type: 'input_text', text: intro },
-            ...segment.images.map((img) => responsesImagePart(img, req.model)),
-        ];
-        const sheet = profile.history.factSheetScope === 'combined'
-            ? (segmentIndex === plan.segments.length - 1 ? combinedSheet : '')
-            : renderHistorySheet(segment.text, coveredSheetTokens);
-        if (sheet) {
-            content.push({ type: 'input_text', text: sheet });
-            if (coveredSheetTokens) {
-                for (const token of extractFactSheetTokens(sheet))
-                    coveredSheetTokens.add(token);
-            }
-        }
-        content.push({ type: 'input_text', text: outro, ...responsesCacheBreakpoint(req, profile) });
-        info.nativeInjectedTokens = (info.nativeInjectedTokens ?? 0)
-            + gptTextTokens(intro + sheet + outro);
-        replacements.set(segment.insertAt, { role: 'user', content });
-    }
-    const removed = new Set(plan.selectedIndices);
-    const rewritten = [];
-    for (let i = 0; i < inputItems.length; i++) {
-        const replacement = replacements.get(i);
-        if (replacement)
-            rewritten.push(replacement);
-        if (!removed.has(i))
-            rewritten.push(inputItems[i]);
-    }
-    req.input = rewritten;
     info.historyImageSha = await sha8(plan.images.map((image) => bytesToBase64(image.png)).join(''));
     return true;
 }
@@ -903,41 +1187,8 @@ export const RESPONSES_HEADER = '================= RENDERED GPT SYSTEM + TOOL CO
     '\n====================== BEGIN RENDERED CONTEXT ======================\n';
 const CHAT_POINTER = 'The full instructions for this message were rendered into image(s) attached to the first user message by pxpipe. Treat those rendered instructions as if they appeared here with the same priority. Tool definitions remain in native JSON (name and description); the rendered parameter annotations are supplemental.';
 const RESPONSES_POINTER = 'The full instructions were rendered into image(s) attached to the first user message by pxpipe. Treat them with the same priority. Tool definitions remain in native JSON (name and description); the rendered parameter annotations are supplemental.';
-// pxlite: keep only the newest N client-pasted images (default 15); older ones become a
-// text marker. Runs on the raw body before any other rewrite so every later stage sees
-// the pruned request (and the prefix stays byte-stable between requests).
-function gptKeepImages() {
-    const n = Number(process.env.PXLITE_KEEP_NATIVE_IMAGES);
-    return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 15;
-}
-export function pruneOldGptImages(body, keepN = gptKeepImages()) {
-    let req;
-    try {
-        req = JSON.parse(new TextDecoder().decode(body));
-    }
-    catch {
-        return body;
-    }
-    const list = Array.isArray(req?.input) ? req.input : Array.isArray(req?.messages) ? req.messages : null;
-    if (!list)
-        return body;
-    const slots = [];
-    const isImg = (p) => p && typeof p === 'object' && (p.type === 'input_image' || p.type === 'image_url');
-    for (const item of list) {
-        if (!item || !Array.isArray(item.content))
-            continue;
-        item.content.forEach((p, i) => { if (isImg(p))
-            slots.push({ arr: item.content, i }); });
-    }
-    if (slots.length <= keepN)
-        return body;
-    const drop = slots.slice(0, slots.length - keepN);
-    for (const s of drop)
-        s.arr[s.i] = { type: s.arr[s.i].type === 'input_image' ? 'input_text' : 'text', text: `[image omitted: older than the last ${keepN} images]` };
-    return new TextEncoder().encode(JSON.stringify(req));
-}
 export async function transformOpenAIChatCompletions(body, opts = {}) {
-    return transformOpenAIChatCompletionsInner(pruneOldGptImages(body), opts);
+    return appendReadNote(await transformOpenAIChatCompletionsInner(body, opts), 'chat', opts);
 }
 async function transformOpenAIChatCompletionsInner(body, opts = {}) {
     const o = resolveOptions(opts);
@@ -997,7 +1248,7 @@ async function transformOpenAIChatCompletionsInner(body, opts = {}) {
     const profile = resolveGptProfile(req.model);
     const finishHistoryOnly = async (reason) => {
         info.reason = reason;
-        if (o.collapseHistory && await applyChatHistoryCollapse(req, info, o, profile, firstUserIdx + 1)) {
+        if (o.collapseHistory && await applyChatHistoryCollapse(req, info, o, profile, firstUserIdx)) {
             info.reason = undefined;
             info.outgoingTextChars = countOutgoingTextChars(req);
             info.compressed = true;
@@ -1055,7 +1306,7 @@ async function transformOpenAIChatCompletionsInner(body, opts = {}) {
     if (o.collapseHistory && profile.providerImageCap !== undefined) {
         const historyReq = structuredClone(req);
         const historyInfo = structuredClone(info);
-        if (await applyChatHistoryCollapse(historyReq, historyInfo, o, profile, firstUserIdx + 1) && countRequestImages(historyReq.messages) + images.length > profile.providerImageCap) {
+        if (await applyChatHistoryCollapse(historyReq, historyInfo, o, profile, firstUserIdx) && countRequestImages(historyReq.messages) + images.length > profile.providerImageCap) {
             historyInfo.outgoingTextChars = countOutgoingTextChars(historyReq);
             historyInfo.compressed = true;
             return { body: new TextEncoder().encode(JSON.stringify(historyReq)), info: historyInfo };
@@ -1129,7 +1380,7 @@ async function transformOpenAIChatCompletionsInner(body, opts = {}) {
     return { body: new TextEncoder().encode(JSON.stringify(req)), info };
 }
 export async function transformOpenAIResponses(body, opts = {}) {
-    return transformOpenAIResponsesInner(pruneOldGptImages(body), opts);
+    return appendReadNote(await transformOpenAIResponsesInner(body, opts), 'responses', opts);
 }
 async function transformOpenAIResponsesInner(body, opts = {}) {
     const o = resolveOptions(opts);
@@ -1172,6 +1423,9 @@ async function transformOpenAIResponsesInner(body, opts = {}) {
         info.reason = 'invalid_input';
         return { body: pinBody, info };
     }
+    // Checkpoints count the original client stream, not an inserted slab item.
+    const summarySourceItems = inputItems;
+    let summarySlab;
     // Find first user item index (skip non-message items like function_call_output, reasoning).
     const firstUserIdx = inputItems.findIndex((item) => typeof item.role === 'string' &&
         item.role === 'user');
@@ -1217,12 +1471,18 @@ async function transformOpenAIResponsesInner(body, opts = {}) {
         // the original here turns a hard 413 into a plain uncompressed request.
         const serializedByteLimit = profile.maxSerializedRequestBytes;
         if (serializedByteLimit !== undefined && encoded.byteLength > serializedByteLimit) {
+            if (info.gptCacheGate?.history_mode === 'summary')
+                info.gptCacheGate = { ...info.gptCacheGate, wire_applied: false,
+                    accept: false, reason: 'serialized_request_limit' };
             if (body.byteLength > serializedByteLimit) {
                 info.reason = 'serialized_request_limit';
                 info.compressed = true;
                 return { body, info };
             }
-            return { body, info: emptyInfo('serialized_request_limit') };
+            const fallbackInfo = emptyInfo('serialized_request_limit');
+            if (info.gptCacheGate?.history_mode === 'summary')
+                fallbackInfo.gptCacheGate = info.gptCacheGate;
+            return { body, info: fallbackInfo };
         }
         info.outgoingTextChars = countResponsesOutgoingTextChars(req);
         info.compressed = true;
@@ -1336,6 +1596,7 @@ async function transformOpenAIResponsesInner(body, opts = {}) {
             role: 'user',
             content: [...imagePartsResp, ...slabFactSheetPart, endMarker],
         };
+        summarySlab = { at: firstUserIdx, item: slabUserItem };
         inputItems = [
             ...inputItems.slice(0, firstUserIdx),
             slabUserItem,
@@ -1369,8 +1630,11 @@ async function transformOpenAIResponsesInner(body, opts = {}) {
     // Responses protocol state is not an ordinary contiguous conversation prefix.
     // The profile selects pair-only legacy coverage or mixed safe-message coverage;
     // both preserve recent/open/malformed calls and opaque protocol barriers.
+    if (rewrittenTools !== undefined)
+        req.tools = rewrittenTools;
     if (o.collapseHistory && !inputWasString) {
-        await applyResponsesHistoryCollapse(req, inputItems, info, o, profile);
+        await applyResponsesHistoryCollapse(req, inputItems, info, o, profile,
+            { items: summarySourceItems, slab: summarySlab });
     }
     if (rewrittenTools !== undefined)
         req.tools = rewrittenTools;

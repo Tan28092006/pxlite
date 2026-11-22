@@ -42,13 +42,16 @@ export function classifyCompaction(bytes) {
   } catch {
     return { compact: false, where: 'unparsable' };
   }
-  const msgs = Array.isArray(body?.messages) ? body.messages : [];
+  const msgs = Array.isArray(body?.messages) ? body.messages
+    : Array.isArray(body?.input) ? body.input
+    : typeof body?.input === 'string' ? [{ role: 'user', content: body.input }] : [];
   if (hasMarker(body?.system)) return { compact: true, where: 'system' };
+  if (hasMarker(body?.instructions)) return { compact: true, where: 'instructions' };
   const lastIdx = msgs.findLastIndex((m) => m?.role !== 'system');
   const last = msgs[lastIdx];
   if (last?.role === 'user') {
     const blocks = typeof last.content === 'string' ? [{ type: 'text', text: last.content }] : last.content ?? [];
-    if (blocks.some((b) => b?.type === 'text' && typeof b.text === 'string' && b.text.includes(COMPACT_MARKER))) {
+    if (blocks.some((b) => (b?.type === 'text' || b?.type === 'input_text') && typeof b.text === 'string' && b.text.includes(COMPACT_MARKER))) {
       return { compact: true, where: 'last-user' };
     }
   }
@@ -58,13 +61,43 @@ export function classifyCompaction(bytes) {
 
 export const isCompactionRequest = (bytes) => classifyCompaction(bytes).compact;
 
-/** Remove every `prompt_cache_breakpoint` key from a JSON request body
- *  (string, Uint8Array or ArrayBuffer); other bodies pass through unchanged. */
-export function stripCacheBreakpoints(body) {
+/** Backend-specific compatibility, not a global cache opt-out. Without a URL,
+ * retain the legacy strip behavior for callers that explicitly request it.
+ * Both the public Responses route and Codex reject pxpipe's cache anchor for Sol.
+ * Never touch a tool schema/property or JSON arguments that happen to use the name. */
+export function stripCacheBreakpoints(body, { url } = {}) {
+  let backend;
+  if (url) {
+    let u;
+    try { u = new URL(url); } catch { return body; }
+    if (u.protocol !== 'https:') return body;
+    if (u.hostname === 'api.openai.com' && /^\/v1\/responses(?:\/|$)/.test(u.pathname)) backend = 'api';
+    else if (u.hostname === 'chatgpt.com' && /^\/backend-api\/codex\/responses(?:\/|$)/.test(u.pathname)) backend = 'codex';
+    else return body;
+  }
   let text = null;
   if (typeof body === 'string') text = body;
   else if (body instanceof Uint8Array || body instanceof ArrayBuffer) text = new TextDecoder().decode(body);
   if (text === null || !text.includes('"prompt_cache_breakpoint"')) return body;
-  const out = JSON.stringify(JSON.parse(text), (k, v) => (k === 'prompt_cache_breakpoint' ? undefined : v));
+  const req = JSON.parse(text);
+  // A caller deliberately selecting explicit-only caching owns that decision.
+  // Leave it intact (including any upstream rejection), rather than silently
+  // sending explicit mode with no anchors and turning caching off.
+  if (backend && req.prompt_cache_options?.mode === 'explicit') return body;
+  let changed = false;
+  const strip = part => {
+    if (part && typeof part === 'object' && Object.hasOwn(part, 'prompt_cache_breakpoint')) {
+      delete part.prompt_cache_breakpoint;
+      changed = true;
+    }
+  };
+  strip(req);
+  for (const item of Array.isArray(req.input) ? req.input : []) {
+    strip(item);
+    for (const parts of [item?.content, item?.output])
+      if (Array.isArray(parts)) for (const part of parts) strip(part);
+  }
+  if (!changed) return body;
+  const out = JSON.stringify(req);
   return typeof body === 'string' ? out : new TextEncoder().encode(out);
 }

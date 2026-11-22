@@ -27,7 +27,7 @@ import { countTokens as o200kCountTokens } from 'gpt-tokenizer/encoding/o200k_ba
 // tool call is one line (tool-lines.mjs) and of the tool output only failures and subagent
 // reports survive. Off with PXLITE_HISTORY_KEEP_TOOLS=1. The raw text still feeds the token
 // floor and the profit gate (turn.rawText), so the saving of dropping the output is counted.
-import { SUBAGENT_TOOL_NAMES, errorLine, isLaunchAck, reportBlock, toolCallLines } from '../../../../tool-lines.mjs';
+import { SUBAGENT_TOOL_NAMES, errorLine, isLaunchAck, reportBlock, toolCallLines, clip, MAX_CALL_CHARS } from '../../../../tool-lines.mjs';
 import { looksFailed } from '../../../../collapse-tools.mjs';
 const HISTORY_DROP_TOOLS = !/^(1|true|yes|on)$/i.test(process.env.PXLITE_HISTORY_KEEP_TOOLS ?? '');
 function parseArgs(raw) {
@@ -71,6 +71,61 @@ export const GPT_HISTORY_DEFAULTS = {
     maxImages: DEFAULT_GPT_PROFILE.history.maxImages,
     reflow: true,
 };
+// Managed sessions advance on input-item epochs, independent of per-response
+// cache counters. Snapshot the live-tail classification at the epoch's start:
+// otherwise a newly appended shell result can make an old round eligible again.
+export function checkpointWindow(length, opts, start = 0) {
+    const chunk = Math.floor(opts.checkpointChunk ?? 0);
+    if (!Number.isFinite(chunk) || chunk <= 1)
+        return { managed: false, cutoff: length, frameEnd: length };
+    // Use one floor in calm and tool phases, so toggling a tail rule cannot
+    // uncollapse/re-image an earlier prefix between checkpoints.
+    const tail = Math.max(12, opts.keepTail ?? 0, (opts.keepRecentPairs ?? 0) * 2);
+    const available = Math.max(0, length - start - tail);
+    const explicit = Number.isFinite(opts.checkpointCutoff) && opts.checkpointCutoff >= 0;
+    if (!explicit && available < chunk && opts.checkpointBootstrap)
+        return { managed: true, cutoff: start + available, frameEnd: length };
+    const cutoff = explicit ? Math.max(start, Math.min(start + available, Math.floor(opts.checkpointCutoff)))
+        : start + Math.floor(available / chunk) * chunk;
+    return { managed: true, cutoff, frameEnd: Math.min(length, cutoff + tail) };
+}
+function checkpointOptions(opts) {
+    return Math.floor(opts.checkpointChunk ?? 0) > 1
+        ? { ...opts, keepTail: Math.max(12, opts.keepTail), keepRecentPairs: Math.max(6, opts.keepRecentPairs) }
+        : opts;
+}
+/** Fixed-epoch pruning, not a sliding window. Ciphertext is never interpreted.
+ * References and reasoning associated with incomplete/malformed rounds win over
+ * the historical cap; live state beyond the fixed frame is left untouched. */
+export function responsesReasoningPrune(items, checkpoint, keep = 50) {
+    const frameEnd = Math.min(items.length, checkpoint.frameEnd);
+    const indices = [];
+    for (let i = 0; i < frameEnd; i++)
+        if (items[i]?.type === 'reasoning') indices.push(i);
+    const limit = Math.max(0, Math.floor(keep));
+    if (!Number.isFinite(limit) || indices.length <= limit)
+        return { removed: [], kept: indices.length, protected: 0 };
+    const referenced = responseReferencedIds(items);
+    const closed = new Set(classifyResponsesPairs(items, 0).completed.flatMap(round => round.indices));
+    let lastReasoning = -1;
+    let openStart = Infinity;
+    for (let i = 0; i < items.length; i++) {
+        if (items[i]?.type === 'reasoning') lastReasoning = i;
+        if ((isResponsesToolCall(items[i]) || isResponsesToolOutput(items[i])) && !closed.has(i))
+            openStart = Math.min(openStart, lastReasoning >= 0 ? lastReasoning : i);
+    }
+    const retainFrom = limit > 0 ? indices.at(-limit) : Infinity;
+    let protectedCount = 0;
+    const removed = indices.filter(i => {
+        const protectedItem = i >= openStart || referenced.has(items[i]?.id);
+        if (protectedItem) protectedCount++;
+        return i < checkpoint.cutoff && i < retainFrom && !protectedItem;
+    });
+    return { removed, kept: indices.length - removed.length, protected: protectedCount };
+}
+function responseHasClientImages(item) {
+    return [item?.content, item?.output].some(parts => Array.isArray(parts) && parts.some(isHistoryImagePart));
+}
 function safeJson(v) {
     if (typeof v === 'string')
         return v;
@@ -80,6 +135,56 @@ function safeJson(v) {
     catch {
         return String(v ?? '');
     }
+}
+// Known client images may lose pixels only inside a selected history checkpoint.
+// Do not render inline base64 as text or invent a local path for an attachment.
+function isHistoryImagePart(part) {
+    return !!part && typeof part === 'object'
+        && (part.type === 'input_image' || part.type === 'image_url' || part.type === 'image');
+}
+function imageHistoryMarker(part) {
+    const url = typeof part.image_url === 'string' ? part.image_url : part.image_url?.url;
+    const source = [part.file_path, part.filePath, part.path, part.source?.path, part.source?.url, url]
+        .find((s) => typeof s === 'string' && s.trim() && !/^\s*data:/i.test(s));
+    if (source)
+        return `[image source: ${JSON.stringify(source)}]`;
+    if (typeof part.file_id === 'string' && part.file_id)
+        return `[image file_id: ${JSON.stringify(part.file_id)}]`;
+    return '[image]';
+}
+function imageHistoryNotes(content) {
+    return Array.isArray(content) ? content.filter(isHistoryImagePart).map(imageHistoryMarker).join('\n') : '';
+}
+/** null means real unknown protocol payload, not a known image. */
+function historyContentText(content) {
+    if (typeof content === 'string')
+        return content;
+    if (!Array.isArray(content))
+        return null;
+    const parts = [];
+    for (const p of content) {
+        if (!p || typeof p !== 'object')
+            return null;
+        if (isHistoryImagePart(p))
+            parts.push(imageHistoryMarker(p));
+        else if (p.type === 'refusal' && typeof p.refusal === 'string')
+            parts.push(p.refusal);
+        else if ((p.type === 'text' || p.type === 'input_text' || p.type === 'output_text') && typeof p.text === 'string')
+            parts.push(p.text);
+        else
+            return null;
+    }
+    return parts.join('\n\n');
+}
+/** These images carry rendered text that has no native-text copy here.
+ * They are NOT disposable client screenshots. Never replace them with markers. */
+export function isRenderedGptContext(item) {
+    return Array.isArray(item?.content) && item.content.some((p) => typeof p?.text === 'string' && (
+        p.text === '[End of rendered GPT system/tool context.]'
+        || p.text.startsWith('[pxlite recall:')
+        || p.text.startsWith('[Recall: the conversation turns that the latest context compaction removed,')
+        || p.text.startsWith('[Earlier turns in image(s):')
+    ));
 }
 /** Last index i in [from, cutoffExclusive) where every opened tool-call id has a
  *  matching close. Returns from-1 (no collapse) if none. Stops at the first
@@ -135,7 +240,7 @@ function joinTurns(turns, from, toExclusive, skip, raw = false) {
  * (caller does the splice and builds the format-specific synthetic item).
  */
 export async function planGptCollapse(turns, protectedPrefix, isProfitable, opts = {}) {
-    const o = { ...GPT_HISTORY_DEFAULTS, ...opts };
+    const o = checkpointOptions({ ...GPT_HISTORY_DEFAULTS, ...opts });
     const base = {
         images: [],
         imagesAfter: [],
@@ -150,7 +255,8 @@ export async function planGptCollapse(turns, protectedPrefix, isProfitable, opts
         droppedCodepoints: new Map(),
     };
     const pp = Math.max(0, Math.min(protectedPrefix, turns.length));
-    const rawCutoff = turns.length - o.keepTail;
+    const checkpoint = checkpointWindow(turns.length, o, pp);
+    const rawCutoff = checkpoint.managed ? checkpoint.cutoff : turns.length - o.keepTail;
     if (rawCutoff - pp < o.minCollapsePrefix) {
         return { ...base, reason: 'prefix_too_short' };
     }
@@ -366,8 +472,17 @@ function gptCountTokens(text) {
 // ---- Responses completed-pair planning -------------------------------------
 function responseRoundText(call, output) {
     const name = typeof call.name === 'string' ? call.name : 'tool';
-    const lines = toolCallLines(name, parseArgs(call.type === 'custom_tool_call' ? call.input : call.arguments), { seen: undefined });
-    const out = keptToolOutput(name, typeof output.output === 'string' ? output.output : safeJson(output.output));
+    // Custom tools take raw input, not necessarily JSON. Preserve that input
+    // (notably a screenshot path) rather than silently reducing it to {}.
+    const rawInput = call.type === 'custom_tool_call' && typeof call.input === 'string' ? call.input : '';
+    const parsed = parseArgs(call.type === 'custom_tool_call' ? call.input : call.arguments);
+    const lines = rawInput.trim() && Object.keys(parsed).length === 0
+        ? (name === 'patch' || name === 'apply_patch'
+            ? toolCallLines(name, { input: rawInput })
+            : [`[${name}] ${clip(rawInput.replace(/\s+/g, ' ').trim(), MAX_CALL_CHARS)}`])
+        : toolCallLines(name, parsed, { seen: undefined });
+    const body = historyContentText(output.output) ?? safeJson(output.output);
+    const out = keptToolOutput(name, body) || imageHistoryNotes(output.output);
     return [...lines, out].filter(Boolean).join('\n');
 }
 function responseCallText(item) {
@@ -379,7 +494,7 @@ function responseCallText(item) {
     return `[tool_use ${qualifiedName}]\n${args}`;
 }
 function responseOutputText(item) {
-    const output = typeof item.output === 'string' ? item.output : safeJson(item.output);
+    const output = historyContentText(item.output) ?? safeJson(item.output);
     return `[tool_result]\n${output}`;
 }
 function responseItemType(item) {
@@ -405,28 +520,30 @@ function isRenderableResponsesPair(call, output) {
     if (output.status !== undefined && output.status !== 'completed')
         return false;
     if (call.type !== 'custom_tool_call')
-        return true;
+        return !Array.isArray(output.output) || historyContentText(output.output) !== null;
     if (typeof call.name !== 'string' || !call.name || typeof call.input !== 'string')
         return false;
     if (call.namespace !== undefined && typeof call.namespace !== 'string')
         return false;
-    // Custom tools take raw text, NOT JSON arguments. Their outputs can also
-    // contain images/files; never flatten those into an image of their JSON/URL.
+    // Custom tools take raw text, NOT JSON arguments. Known images may become
+    // markers at a checkpoint; files and unknown payloads must stay native.
     return typeof output.output === 'string'
-        || (Array.isArray(output.output) && output.output.every(part => part && typeof part === 'object' && part.type === 'input_text' && typeof part.text === 'string'));
+        || (Array.isArray(output.output) && historyContentText(output.output) !== null);
 }
 function responseCallId(item) {
     const o = item;
     return o && typeof o.call_id === 'string' ? o.call_id : '';
 }
-/** Return a lossless textual Responses message, or null when the item carries
- * non-text content that must stay native (images, unknown parts, empty state). */
-function responseMessageText(item) {
+/** Text projection for planning. With collapseImages, known client images become
+ * source markers. This does not modify the original item or its live pixels. */
+function responseMessageText(item, collapseImages = false) {
     const o = item;
     if (!o || (o.role !== 'user' && o.role !== 'assistant'))
         return null;
     const itemType = typeof o.type === 'string' ? o.type : '';
     if (itemType && itemType !== 'message')
+        return null;
+    if (isRenderedGptContext(item))
         return null;
     let body = '';
     if (typeof o.content === 'string') {
@@ -439,6 +556,12 @@ function responseMessageText(item) {
             const type = p && typeof p.type === 'string' ? p.type : '';
             if (!p)
                 return null;
+            if (isHistoryImagePart(p)) {
+                if (!collapseImages)
+                    return null;
+                parts.push(imageHistoryMarker(p));
+                continue;
+            }
             // A refusal is plain model-authored prose that happens to ride in its own
             // part type. Rejecting it made the whole message non-imageable, and since
             // a non-imageable message is a hard barrier, ONE refusal split the run and
@@ -496,8 +619,8 @@ function isContentlessMessage(item) {
     }
     return true;
 }
-function responseMessageTranscript(item, index) {
-    const msg = responseMessageText(item);
+function responseMessageTranscript(item, index, collapseImages = false) {
+    const msg = responseMessageText(item, collapseImages);
     return msg ? `<${msg.role} t="${index}">\n${msg.text}\n</${msg.role}>` : null;
 }
 function responseReferencedIds(items) {
@@ -517,7 +640,7 @@ function responseReferencedIds(items) {
  * Accept both adjacent pairs and protocol-atomic parallel rounds:
  * `call A, call B, output A, output B`. Unknown/intervening native items remain
  * hard barriers, and duplicate/reversed/orphan state is never selected. */
-function classifyResponsesPairs(items, keepRecentPairs) {
+function classifyResponsesPairs(items, keepRecentPairs, interleaved = false) {
     const calls = new Map();
     const outputs = new Map();
     let missingIdItems = 0;
@@ -575,6 +698,52 @@ function classifyResponsesPairs(items, keepRecentPairs) {
     // native. This is the shape OpenCode uses for parallel tool calls.
     const completed = [];
     const acceptedCallIndices = new Set();
+    if (interleaved) {
+        // Close dependency intervals, not just calls* outputs*. A call that opens
+        // inside an interval extends it through its output; never select a suffix
+        // of an open/unknown interval. Non-tool items are kept in the interval and
+        // validated by the summary projector, not silently discarded here.
+        for (let i = 0; i < items.length;) {
+            if (!isResponsesToolCall(items[i])) { i++; continue; }
+            const first = pairByCallIndex.get(i);
+            const firstOutputs = outputs.get(responseCallId(items[i])) ?? [];
+            let end = first?.outputIndex ?? (firstOutputs.length === 1 && firstOutputs[0] > i
+                ? firstOutputs[0] : items.length - 1), valid = !!first;
+            const pairs = [], other = [];
+            for (let j = i; j <= end; j++) {
+                if (isResponsesToolCall(items[j])) {
+                    const pair = pairByCallIndex.get(j);
+                    if (!pair) {
+                        valid = false;
+                        const at = outputs.get(responseCallId(items[j])) ?? [];
+                        end = Math.max(end, at.length === 1 && at[0] > j ? at[0] : items.length - 1);
+                        continue;
+                    }
+                    pairs.push(pair);
+                    end = Math.max(end, pair.outputIndex);
+                }
+                else if (isResponsesToolOutput(items[j])) {
+                    const callIndices = calls.get(responseCallId(items[j]));
+                    const pair = callIndices?.length === 1 ? pairByCallIndex.get(callIndices[0]) : null;
+                    if (!pair || pair.callIndex < i || pair.outputIndex !== j) valid = false;
+                }
+                else other.push(j);
+            }
+            if (pairs.length) {
+                completed.push({
+                    pairs, indices: Array.from({ length: end - i + 1 }, (_, k) => i + k),
+                    interleavedIndices: other, safeProtocol: valid, startIndex: i, endIndex: end,
+                    text: pairs.map(pair => pair.text).join('\n\n'),
+                    rawText: pairs.map(pair => pair.rawText ?? pair.text).join('\n\n'),
+                    callTokens: pairs.reduce((n, pair) => n + pair.callTokens, 0),
+                    outputTokens: pairs.reduce((n, pair) => n + pair.outputTokens, 0),
+                });
+                pairs.forEach(pair => acceptedCallIndices.add(pair.callIndex));
+            }
+            i = end + 1;
+        }
+    }
+    else {
     for (let i = 0; i < items.length;) {
         if (!isResponsesToolCall(items[i]) || !pairByCallIndex.has(i)) {
             i++;
@@ -620,6 +789,7 @@ function classifyResponsesPairs(items, keepRecentPairs) {
         for (const pair of calls)
             acceptedCallIndices.add(pair.callIndex);
         i = j;
+    }
     }
     for (const pair of pairByCallIndex.values()) {
         if (!acceptedCallIndices.has(pair.callIndex))
@@ -691,28 +861,38 @@ function freezeResponsesRuns(runs, items, opts, tokensFor) {
             nextIndex++;
         const next = items[nextIndex];
         if (next && !isResponsesToolCall(next) && !isResponsesToolOutput(next)
-            && responseMessageText(next) === null)
+            && responseMessageText(next, true) === null)
             seal();
     }
     return sections;
 }
-/** Profile-gated broad Responses planner. Safe textual messages and complete old
+/** Profile-gated broad Responses planner. Text/image projections and complete old
  * call/output pairs may share one image group only when they are contiguous.
  * Every other item is a hard barrier, preserving native protocol order/state. */
 async function planResponsesMixedCollapse(items, old, completed, state, isProfitable, o) {
     const base = emptyResponsesPairPlan(state);
-    const oldStarts = new Set(old.map((round) => round.startIndex));
-    const oldByCall = new Map((o.freezeChunk > 0 ? completed : old).map((round) => [round.startIndex, round]));
+    const checkpoint = checkpointWindow(items.length, o);
+    const planningItems = checkpoint.managed ? items.slice(0, checkpoint.frameEnd) : items;
+    const anchoredOld = checkpoint.managed
+        ? classifyResponsesPairs(planningItems, o.keepRecentPairs).old.filter(round => round.endIndex < checkpoint.cutoff)
+        : old;
+    const planningCompleted = checkpoint.managed ? completed.filter(round => round.endIndex < checkpoint.frameEnd) : completed;
+    const oldStarts = new Set(anchoredOld.map((round) => round.startIndex));
+    const oldByCall = new Map((o.freezeChunk > 0 ? planningCompleted : anchoredOld).map((round) => [round.startIndex, round]));
     const messageIndices = [];
     const referencedIds = responseReferencedIds(items);
     let latestUserIndex = -1;
+    let anchoredUserIndex = -1;
     for (let i = 0; i < items.length; i++) {
-        const msg = responseMessageText(items[i]);
+        const msg = responseMessageText(items[i], !o.preserveClientImages);
         if (!msg)
             continue;
-        messageIndices.push(i);
+        if (i < planningItems.length)
+            messageIndices.push(i);
         if (msg.role === 'user')
             latestUserIndex = i;
+        if (msg.role === 'user' && i < planningItems.length)
+            anchoredUserIndex = i;
     }
     // slice(-0) returns the WHOLE array, so guard keepTail===0 explicitly —
     // otherwise "protect 0 tail messages" protects every message and blocks
@@ -721,6 +901,8 @@ async function planResponsesMixedCollapse(items, old, completed, state, isProfit
     const protectedMessages = new Set(tail > 0 ? messageIndices.slice(-tail) : []);
     if (latestUserIndex >= 0)
         protectedMessages.add(latestUserIndex);
+    if (anchoredUserIndex >= 0)
+        protectedMessages.add(anchoredUserIndex);
     const runs = [];
     let current = [];
     // Every flush ends a run, and every run renders at least one image. Naming
@@ -739,13 +921,15 @@ async function planResponsesMixedCollapse(items, old, completed, state, isProfit
             runs.push(current);
         current = [];
     };
-    for (let i = 0; i < items.length; i++) {
+    for (let i = 0; i < planningItems.length; i++) {
         const round = oldByCall.get(i);
         const roundReferenced = !!round && round.indices
             .map((index) => items[index])
             .map((item) => item?.id)
             .some((id) => typeof id === 'string' && referencedIds.has(id));
-        if (round && (o.freezeChunk > 0 || !roundReferenced)) {
+        const imageRound = round && o.preserveClientImages
+            && round.indices.some(index => responseHasClientImages(items[index]));
+        if (round && !imageRound && (o.freezeChunk > 0 || !roundReferenced)) {
             current.push({
                 eligible: oldStarts.has(round.startIndex) && !roundReferenced,
                 indices: round.indices,
@@ -757,14 +941,14 @@ async function planResponsesMixedCollapse(items, old, completed, state, isProfit
         }
         const item = items[i];
         const referenced = !!item && typeof item.id === 'string' && referencedIds.has(item.id);
-        const eligible = !protectedMessages.has(i) && !referenced;
-        const text = o.freezeChunk <= 0 && !eligible ? null : responseMessageTranscript(items[i], i);
+        const eligible = i < checkpoint.cutoff && !protectedMessages.has(i) && !referenced;
+        const text = o.freezeChunk <= 0 && !eligible ? null : responseMessageTranscript(items[i], i, !o.preserveClientImages);
         if (text) {
             current.push({
                 eligible,
                 indices: [i],
                 text,
-                baselineTokens: gptCountTokens(responseMessageText(items[i]).text),
+                baselineTokens: gptCountTokens(responseMessageText(items[i], !o.preserveClientImages).text),
             });
             continue;
         }
@@ -805,7 +989,7 @@ async function planResponsesMixedCollapse(items, old, completed, state, isProfit
     const segments = [];
     let remainingImages = maxImages;
     let hitImageCap = false;
-    const frozenRuns = freezeResponsesRuns(runs, items, o, (unit) => unit.baselineTokens)
+    const frozenRuns = freezeResponsesRuns(runs, planningItems, o, (unit) => unit.baselineTokens)
         .filter((run) => run.every((unit) => unit.eligible));
     for (const run of frozenRuns) {
         if (remainingImages === 0) {
@@ -897,10 +1081,18 @@ async function planResponsesMixedCollapse(items, old, completed, state, isProfit
  * Native messages, reasoning, recent rounds, open calls, and malformed state stay
  * in place. Consecutive rounds may share pages, but no segment crosses native state. */
 export async function planResponsesPairCollapse(items, isProfitable, opts = {}) {
-    const o = { ...GPT_HISTORY_DEFAULTS, ...opts, freezeChunk: opts.freezeChunk ?? 0 };
-    const { old, completed, state } = classifyResponsesPairs(items, o.keepRecentPairs);
+    const o = checkpointOptions({ ...GPT_HISTORY_DEFAULTS, ...opts, freezeChunk: opts.freezeChunk ?? 0 });
+    let { old, completed, state } = classifyResponsesPairs(items, o.keepRecentPairs);
     if (o.responsesMode === 'mixed') {
         return planResponsesMixedCollapse(items, old, completed, state, isProfitable, o);
+    }
+    const checkpoint = checkpointWindow(items.length, o);
+    const planningItems = checkpoint.managed ? items.slice(0, checkpoint.frameEnd) : items;
+    if (checkpoint.managed) {
+        const anchored = new Set(classifyResponsesPairs(planningItems, o.keepRecentPairs).old
+            .filter(round => round.endIndex < checkpoint.cutoff).map(round => round.startIndex));
+        old = old.filter(round => anchored.has(round.startIndex));
+        completed = completed.filter(round => round.endIndex < checkpoint.frameEnd);
     }
     const base = emptyResponsesPairPlan(state);
     if (old.length === 0)
@@ -917,6 +1109,7 @@ export async function planResponsesPairCollapse(items, isProfitable, opts = {}) 
     const runs = [];
     const referencedIds = responseReferencedIds(items);
     const oldStarts = new Set(old.filter((round) => !round.indices.some((index) => {
+        if (o.preserveClientImages && responseHasClientImages(items[index])) return true;
         const id = items[index]?.id;
         return typeof id === 'string' && referencedIds.has(id);
     })).map((round) => round.startIndex));
@@ -942,7 +1135,7 @@ export async function planResponsesPairCollapse(items, isProfitable, opts = {}) 
     const segments = [];
     let remainingImages = maxImages;
     let hitImageCap = false;
-    const frozenRuns = freezeResponsesRuns(runs, items, o, (round) => round.callTokens + round.outputTokens)
+    const frozenRuns = freezeResponsesRuns(runs, planningItems, o, (round) => round.callTokens + round.outputTokens)
         .filter((run) => run.every((round) => oldStarts.has(round.startIndex)));
     for (const run of frozenRuns) {
         if (remainingImages === 0) {
@@ -1030,6 +1223,536 @@ export async function planResponsesPairCollapse(items, isProfitable, opts = {}) 
         pairState: state,
     };
 }
+// ---- Public-summary checkpoints (opt-in; legacy planners above are unchanged)
+function summaryMessageText(item, projectionVersion = 2) {
+    if (!item || (item.type !== undefined && item.type !== 'message')
+        || Object.keys(item).some(key => !['type', 'role', 'content', 'id', 'status',
+            ...(projectionVersion >= 2 ? ['phase'] : [])].includes(key))
+        || (Object.hasOwn(item, 'phase') && (item.role !== 'assistant'
+            || ![null, 'commentary', 'final_answer'].includes(item.phase)))
+        || (item.status !== undefined && item.status !== 'completed')
+        || (item.id !== undefined && typeof item.id !== 'string')
+        || isRenderedGptContext(item) || responseHasClientImages(item))
+        return null;
+    // Unlike the legacy broad projector, an unknown part with a text property is
+    // still opaque protocol state, not permission to discard the original.
+    if (Array.isArray(item.content) && item.content.some(part => !part
+        || !['text', 'input_text', 'output_text', 'refusal'].includes(part.type)
+        || (part.type === 'refusal' ? typeof part.refusal !== 'string' : typeof part.text !== 'string')
+        || (part.annotations !== undefined && (!Array.isArray(part.annotations) || part.annotations.length))))
+        return null;
+    const message = responseMessageText(item);
+    if (!message && projectionVersion >= 3 && item.role === 'assistant' && isContentlessMessage(item))
+        return { role: 'assistant', text: '', ...(typeof item.phase === 'string' ? { phase: item.phase } : {}) };
+    return message && typeof item.phase === 'string'
+        ? { ...message, phase: item.phase } : message;
+}
+function publicReasoningSummary(item, index, projectionVersion = 2) {
+    // Never serialize, decode or tokenize encrypted_content. Unknown reasoning
+    // payloads remain native; only the explicitly public summary field is read.
+    if (!item || item.type !== 'reasoning'
+        || Object.keys(item).some(key => !['type', 'id', 'status', 'summary', 'encrypted_content',
+            ...(projectionVersion >= 3 ? ['content'] : [])].includes(key))
+        || (item.id !== undefined && typeof item.id !== 'string')
+        || (item.status !== undefined && item.status !== 'completed')
+        || (item.encrypted_content !== undefined && typeof item.encrypted_content !== 'string'
+            && !(projectionVersion >= 3 && item.encrypted_content === null))
+        || (projectionVersion >= 3 && item.content !== undefined && (!Array.isArray(item.content)
+            || item.content.some(part => !part || part.type !== 'reasoning_text' || typeof part.text !== 'string'
+                || Object.keys(part).some(key => key !== 'type' && key !== 'text'))))
+        || (item.summary !== undefined && !Array.isArray(item.summary)))
+        return null;
+    const notes = [];
+    for (const part of item.summary ?? []) {
+        if (!part || !['summary_text', 'text'].includes(part.type) || typeof part.text !== 'string'
+            || Object.keys(part).some(key => key !== 'type' && key !== 'text'))
+            return null;
+        if (part.text.trim())
+            notes.push(part.text);
+    }
+    return {
+        text: notes.length ? `<assistant t="${index}" kind="reasoning-summary" notes="lossy public notes">\n${notes.join('\n\n')}\n</assistant>` : '',
+        summaries: notes.length,
+        baselineTokens: gptCountTokens(notes.join('\n\n')),
+    };
+}
+/** Strip only explicitly typed child reasoning blocks in structured reports.
+ * Ordinary strings (including prose mentioning "thinking") are never searched
+ * or heuristically rewritten. Handles are returned separately so reportBlock's
+ * head/tail clipping cannot discard a continuation token in the middle. */
+const SUMMARY_CONTINUATION_KEYS = new Set([
+    'sessionid', 'session_id', 'agent', 'agentid', 'agent_id',
+    'task', 'taskid', 'task_id', 'resume', 'resumeid', 'resume_id', 'handle',
+]);
+function publicSubagentResult(text) {
+    let value;
+    try {
+        value = JSON.parse(text);
+    }
+    catch {
+        return { text, continuation: '' };
+    }
+    if (!value || typeof value !== 'object')
+        return { text, continuation: '' };
+    let changed = false;
+    const continuation = [];
+    const seenHandles = new Set();
+    let handleChars = 0;
+    const visit = (node) => {
+        if (!node || typeof node !== 'object')
+            return node;
+        for (const [key, val] of Object.entries(node)) {
+            // Explicit structured keys only; never scan prose for identifiers.
+            // Keep exact bounded values, not clipped/invalid continuation IDs.
+            if (!SUMMARY_CONTINUATION_KEYS.has(key.toLowerCase())
+                || !(typeof val === 'string' && val.trim() && val.length <= 512
+                    || typeof val === 'number' && Number.isSafeInteger(val)))
+                continue;
+            const encoded = safeJson(val);
+            const identity = `${key.toLowerCase()}\0${encoded}`;
+            const line = `${key}: ${encoded}`;
+            if (!seenHandles.has(identity) && continuation.length < 32
+                && handleChars + line.length <= 4096) {
+                seenHandles.add(identity);
+                continuation.push(line);
+                handleChars += line.length;
+            }
+        }
+        if (['reasoning', 'thinking', 'redacted_thinking'].includes(node.type)) {
+            changed = true;
+            const handles = Object.fromEntries(Object.entries(node).filter(([key, val]) =>
+                /^(id|session_?id|agent_?id|task_?id|call_?id|resume_?id|handle)$/i.test(key)
+                && (typeof val === 'string' || typeof val === 'number')));
+            return Object.keys(handles).length ? handles : undefined;
+        }
+        if (Array.isArray(node))
+            return node.map(visit).filter(part => part !== undefined);
+        return Object.fromEntries(Object.entries(node).map(([key, val]) => [key, visit(val)])
+            .filter(([, val]) => val !== undefined));
+    };
+    const result = visit(value);
+    return {
+        text: changed ? safeJson(result ?? '') : text,
+        continuation: continuation.length ? `[Subagent continuation handles]\n${continuation.join('\n')}` : '',
+    };
+}
+function summaryPairIsSafe(call, output, referenced, projectionVersion = 2) {
+    const extended = projectionVersion >= 3;
+    if (typeof call.name !== 'string' || !call.name.trim()) return false;
+    if (Object.keys(call).some(key => !['type', 'id', 'call_id', 'name', 'namespace', 'arguments', 'input', 'status',
+        ...(extended ? ['async', 'caller'] : [])].includes(key))
+        || Object.keys(output).some(key => !['type', 'id', 'call_id', 'output', 'status',
+            ...(extended ? ['name', 'namespace', 'caller'] : [])].includes(key)))
+        return false;
+    if (extended) {
+        const direct = value => value === undefined || value === null
+            || (typeof value === 'object' && !Array.isArray(value) && value.type === 'direct'
+                && Object.keys(value).length === 1);
+        if (!direct(call.caller) || !direct(output.caller)
+            || (call.async !== undefined && call.async !== false)
+            || (output.name !== undefined && (typeof output.name !== 'string'
+                || ![call.name, call.name?.split('.').at(-1),
+                    call.namespace ? `${call.namespace}.${call.name}` : call.name].includes(output.name)))
+            || (output.namespace !== undefined && (typeof output.namespace !== 'string'
+                || (call.namespace !== undefined && call.namespace !== output.namespace))))
+            return false;
+    }
+    if ([call, output].some(item => responseHasClientImages(item)
+        || [item?.id, item?.call_id].some(id => typeof id === 'string' && referenced.has(id))
+        || (item?.id !== undefined && typeof item.id !== 'string')))
+        return false;
+    if (typeof call.name !== 'string' || !call.name.trim()
+        || (call.namespace !== undefined && typeof call.namespace !== 'string')
+        || (typeof output.output !== 'string'
+            && (!Array.isArray(output.output) || historyContentText(output.output) === null)))
+        return false;
+    if (call.type === 'custom_tool_call')
+        return typeof call.input === 'string';
+    if (typeof call.arguments !== 'string')
+        return false;
+    try {
+        const args = JSON.parse(call.arguments);
+        return !!args && typeof args === 'object' && !Array.isArray(args)
+            && (!extended || summaryCallProjection(call, output) !== null);
+    }
+    catch {
+        return false;
+    }
+}
+function summaryCallProjection(call, output = {}, depth = 0, budget = { count: 0 }) {
+    if (depth > 4 || ++budget.count > 128) return null;
+    const namespace = call.namespace ?? output.namespace;
+    const qualified = namespace && !call.name.startsWith(`${namespace}.`)
+        ? `${namespace}.${call.name}` : call.name;
+    const leaf = call.name.split('.').at(-1);
+    const args = call.type === 'custom_tool_call'
+        ? { input: call.input, _raw: call.input } : parseArgs(call.arguments);
+    if (qualified === 'multi_tool_use.parallel') {
+        const uses = args.tool_uses;
+        if (!Array.isArray(uses) || !uses.length || uses.length > 128) return null;
+        const lines = [`[${qualified}] ${uses.length} child calls`];
+        let subagent = false;
+        for (const use of uses) {
+            if (!use || typeof use.recipient_name !== 'string' || !use.recipient_name.trim()
+                || !use.parameters || typeof use.parameters !== 'object' || Array.isArray(use.parameters)
+                || Object.keys(use).some(key => !['recipient_name', 'parameters'].includes(key))) return null;
+            const child = summaryCallProjection({ type: 'function_call', name: use.recipient_name,
+                arguments: JSON.stringify(use.parameters) }, {}, depth + 1, budget);
+            if (!child) return null;
+            lines.push(child.text);
+            subagent ||= child.subagent;
+        }
+        return { text: lines.join('\n'), leaf, subagent };
+    }
+    const lines = toolCallLines(leaf, args).map(line =>
+        qualified !== leaf && line.startsWith(`[${leaf}]`)
+            ? `[${qualified}]${line.slice(leaf.length + 2)}` : line);
+    if (qualified !== leaf && !lines.some(line => line.includes(qualified)))
+        lines.unshift(`[tool ${clip(qualified, MAX_CALL_CHARS)}]`);
+    return { text: lines.join('\n'), leaf, subagent: SUBAGENT_TOOL_NAMES.has(leaf) };
+}
+// v4: a completed local Read can be reissued from this exact source locator.
+// This is retirement by age/checkpoint, not a claim that a later read superseded it.
+function retiredReadLocator(call, output) {
+    if (!HISTORY_DROP_TOOLS || call?.type !== 'function_call'
+        || call.name?.split('.').at(-1)?.toLowerCase() !== 'read') return null;
+    const args = parseArgs(call.arguments);
+    const path = args.file_path ?? args.filePath ?? args.path ?? args.file;
+    const body = historyContentText(output?.output);
+    if (typeof path !== 'string' || !path.trim() || /^(?:https?:|data:)/i.test(path)
+        || body === null || body.length <= 200 || looksFailed(body)) return null;
+    if ([args.offset, args.limit].some(value => value !== undefined
+        && (!Number.isSafeInteger(value) || value < 0))) return null;
+    const qualified = call.namespace && !call.name.startsWith(`${call.namespace}.`)
+        ? `${call.namespace}.${call.name}` : call.name;
+    return `[${qualified}] ${JSON.stringify(path)}`
+        + (args.offset !== undefined ? ` offset=${args.offset}` : '')
+        + (args.limit !== undefined ? ` limit=${args.limit}` : '')
+        + ' [older Read output >200 chars omitted; re-read this range if needed]';
+}
+function summaryRoundProjection(round, items, offset = 0, projectionVersion = 2) {
+    // Keep absolute source roles/indices, even when parallel outputs arrive in a
+    // different order. The same toolCallLines/keptToolOutput policy is used, but
+    // only a subagent's public result (never typed child thinking) is projected.
+    const parts = new Map();
+    for (const pair of round.pairs) {
+        const call = items[pair.callIndex];
+        const output = items[pair.outputIndex];
+        const name = call.name;
+        const projection = projectionVersion >= 3 ? summaryCallProjection(call, output) : null;
+        const subagent = projectionVersion >= 3 ? projection?.subagent : SUBAGENT_TOOL_NAMES.has(name);
+        const readLocator = projectionVersion >= 4 ? retiredReadLocator(call, output) : null;
+        const lines = readLocator ?? (projectionVersion >= 3 ? projection?.text
+            : responseRoundText(call, { ...output, output: '' }));
+        if (lines)
+            parts.set(pair.callIndex, `<assistant t="${pair.callIndex + offset}" kind="tool-call">\n${lines}\n</assistant>`);
+        let body = historyContentText(output.output);
+        let continuation = '';
+        if (subagent) {
+            const report = publicSubagentResult(body);
+            body = report.text;
+            continuation = report.continuation;
+        }
+        const outputName = subagent ? 'subagent' : name;
+        const report = keptToolOutput(outputName, body)
+            || (subagent && body.trim() && isLaunchAck(body) ? reportBlock('subagent', body) : '');
+        const kept = [report, continuation].filter(Boolean).join('\n');
+        if (kept)
+            parts.set(pair.outputIndex, `<tool t="${pair.outputIndex + offset}">\n${kept}\n</tool>`);
+    }
+    if (projectionVersion >= 3) for (const index of round.interleavedIndices ?? []) {
+        const msg = summaryMessageText(items[index], projectionVersion);
+        if (msg?.text.trim())
+            parts.set(index, `<${msg.role} t="${index + offset}"${msg.phase ? ` phase="${msg.phase}"` : ''}>\n${msg.text}\n</${msg.role}>`);
+    }
+    return [...parts].sort(([a], [b]) => a - b).map(([, text]) => text).join('\n\n');
+}
+function summaryDuplicateCallIds(items) {
+    // Cheap prefix-wide protocol check. Bounded epoch classification must not
+    // mistake a local pair for a unique pair when an older native item shares
+    // its call_id. This never serializes or tokenizes any item.
+    const calls = new Set();
+    const outputs = new Set();
+    const duplicates = new Set();
+    for (const item of items) {
+        const seen = isResponsesToolCall(item) ? calls : isResponsesToolOutput(item) ? outputs : null;
+        const id = seen ? responseCallId(item) : '';
+        if (!id)
+            continue;
+        if (seen.has(id))
+            duplicates.add(id);
+        seen.add(id);
+    }
+    return duplicates;
+}
+function summaryCheckpointUnits(items, referenced, anchor, offset, source, duplicateIds, projectionVersion) {
+    // Only this epoch's unsealed source + lookahead is tokenized/projected.
+    // Indices become absolute immediately, before grouping or rendering.
+    const { completed } = classifyResponsesPairs(items, 0, projectionVersion >= 3);
+    const rounds = new Map(completed.map(round => [round.startIndex, round]));
+    const atoms = [];
+    for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        const round = rounds.get(i);
+        if (round) {
+            // The legacy classifier can discover a valid suffix after a native
+            // call, or a prefix before an orphan output. Neither is a complete
+            // parallel batch. Do not split off that apparently valid subset.
+            const nativeBetween = round.safeProtocol === false || (round.interleavedIndices ?? []).some(index =>
+                items[index]?.role !== 'assistant' || summaryMessageText(items[index], projectionVersion) === null);
+            const safe = !isResponsesToolCall(source[offset + i - 1])
+                && !isResponsesToolOutput(items[round.endIndex + 1])
+                && !nativeBetween
+                && round.pairs.every(pair => !duplicateIds.has(responseCallId(items[pair.callIndex]))
+                    && summaryPairIsSafe(items[pair.callIndex], items[pair.outputIndex], referenced, projectionVersion))
+                && (round.interleavedIndices ?? []).every(index => !referenced.has(items[index]?.id));
+            const absoluteRound = {
+                ...round,
+                startIndex: round.startIndex + offset, endIndex: round.endIndex + offset,
+                indices: round.indices.map(index => index + offset),
+                pairs: round.pairs.map(pair => ({ ...pair,
+                    callIndex: pair.callIndex + offset, outputIndex: pair.outputIndex + offset })),
+            };
+            atoms.push({
+                start: i + offset, endExclusive: round.endIndex + offset + 1, indices: absoluteRound.indices,
+                safe, text: safe ? summaryRoundProjection(round, items, offset, projectionVersion) : '',
+                nativeReason: safe ? null : round.pairs.some(pair =>
+                    responseHasClientImages(items[pair.callIndex]) || responseHasClientImages(items[pair.outputIndex]))
+                    ? 'client_image' : nativeBetween ? 'native_interleaved_state' : 'native_tool_shape',
+                baselineTokens: round.callTokens + round.outputTokens
+                    + (round.interleavedIndices ?? []).reduce((n, index) =>
+                        n + gptCountTokens(summaryMessageText(items[index], projectionVersion)?.text ?? ''), 0),
+                rounds: [absoluteRound],
+                retiredReads: projectionVersion >= 4 && safe
+                    && !(round.interleavedIndices ?? []).length
+                    && round.pairs.every(pair => retiredReadLocator(items[pair.callIndex], items[pair.outputIndex]) !== null),
+                reasoning: [], summaries: 0,
+            });
+            i = round.endIndex;
+            continue;
+        }
+        const isReasoning = item?.type === 'reasoning';
+        const index = i + offset;
+        const note = isReasoning ? publicReasoningSummary(item, index, projectionVersion) : null;
+        const msg = !isReasoning ? summaryMessageText(item, projectionVersion) : null;
+        const safe = index !== anchor && !referenced.has(item?.id)
+            && (isReasoning ? note !== null : msg !== null);
+        atoms.push({
+            start: index, endExclusive: index + 1, indices: [index], safe,
+            nativeReason: safe ? null : referenced.has(item?.id) ? 'native_reference'
+                : responseHasClientImages(item) ? 'client_image'
+                : isReasoning ? 'native_reasoning_shape'
+                : projectionVersion === 1 && item?.role === 'assistant'
+                    && ['commentary', 'final_answer'].includes(item.phase) ? 'assistant_phase_legacy'
+                : 'native_message_shape',
+            text: safe ? (note?.text ?? (msg.text.trim()
+                ? `<${msg.role} t="${index}"${msg.phase ? ` phase="${msg.phase}"` : ''}>\n${msg.text}\n</${msg.role}>` : '')) : '',
+            baselineTokens: note?.baselineTokens ?? (msg ? gptCountTokens(msg.text) : 0),
+            reasoning: isReasoning ? [index] : [], summaries: note?.summaries ?? 0, rounds: [],
+        });
+    }
+    const units = [];
+    for (let i = 0; i < atoms.length; i++) {
+        const first = atoms[i];
+        if (!first.reasoning.length) {
+            units.push(first);
+            continue;
+        }
+        // A reasoning item belongs to its response AND following tool round(s),
+        // up to the next user/authority or next response's reasoning. A native
+        // call/output/unknown/reference anywhere in that unit protects it all.
+        // Consecutive reasoning items are separate responses too: an opaque-only
+        // history must not become one unbounded, permanently unsealable unit.
+        const group = [first];
+        while (i + 1 < atoms.length) {
+            const next = atoms[i + 1];
+            const item = source[next.start];
+            if (['user', 'system', 'developer'].includes(item?.role)
+                || next.reasoning.length)
+                break;
+            group.push(next);
+            i++;
+        }
+        units.push({
+            start: first.start, endExclusive: group.at(-1).endExclusive,
+            indices: group.flatMap(atom => atom.indices), safe: group.every(atom => atom.safe),
+            nativeReason: group.find(atom => !atom.safe)?.nativeReason ?? null,
+            text: group.map(atom => atom.text).filter(Boolean).join('\n\n'),
+            baselineTokens: group.reduce((n, atom) => n + atom.baselineTokens, 0),
+            reasoning: group.flatMap(atom => atom.reasoning),
+            summaries: group.reduce((n, atom) => n + atom.summaries, 0),
+            rounds: group.flatMap(atom => atom.rounds),
+        });
+    }
+    return { units };
+}
+/**
+ * Independent original-source epochs, never a rolling/repacked prefix. Each
+ * epoch sees the same fixed target+tail snapshot on every append-only request.
+ * Correction: targets stay on the original grid, but each source range starts
+ * at the previous safe cut. A crossing unit is deferred and carried whole into
+ * a later epoch, NOT permanently pinned native. Already-sealed pages never
+ * change. Genuinely unsafe/referenced units remain native.
+ * `closedThrough` is exclusive; summaryState fields are counts and epochs are
+ * {start,target,closedThrough,removed,summaries,protected}. Epoch protected counts
+ * include that epoch's deferred units; the aggregate counts final native items
+ * only, without double-counting repeated carries.
+ */
+export async function planResponsesSummaryCollapse(items, isProfitable, opts = {}) {
+    opts = opts && typeof opts === 'object' ? opts : {};
+    const o = { ...GPT_HISTORY_DEFAULTS, ...opts };
+    const integer = (value, fallback) => Number.isFinite(value) ? Math.floor(value) : fallback;
+    const chunk = integer(opts.checkpointChunk, 50);
+    const tail = Math.max(30, integer(opts.keepTail, 30));
+    const maxImages = Math.max(0, integer(o.maxImages, 0));
+    const summaryState = { removed: 0, summaries: 0, protected: 0, closedThrough: 0, epochs: [] };
+    const base = { ...emptyResponsesPairPlan(classifyResponsesPairs([], 0).state), summaryState };
+    if (!Array.isArray(items))
+        return { ...base, reason: 'invalid_input' };
+    // Full-request telemetry is measured once, not once per historical epoch.
+    const projectionVersion = opts.projectionVersion ?? 3;
+    const allPairs = classifyResponsesPairs(items, 0, projectionVersion >= 3);
+    base.pairState = allPairs.state;
+    if (chunk <= 1)
+        return { ...base, reason: 'no_closed_prefix' };
+    let limit = Math.max(0, items.length - tail);
+    if (opts.checkpointCutoff !== undefined)
+        limit = Math.min(limit, Math.max(0, integer(opts.checkpointCutoff, 0)));
+    const cutoff = Math.floor(limit / chunk) * chunk;
+    if (!cutoff)
+        return { ...base, reason: 'no_closed_prefix' };
+    const anchor = items.findIndex(item => item?.role === 'user' && !isRenderedGptContext(item));
+    // References always win, including references to old items in the live tail.
+    const referenced = responseReferencedIds(items);
+    const failSafe = reason => ({
+        ...base, reason,
+        summaryState: { removed: 0, summaries: 0, protected: 0, closedThrough: 0, epochs: [] },
+    });
+    const segments = [];
+    const selectedRounds = [];
+    const removed = new Set();
+    const nativePairReasons = new Map();
+    let imageCount = 0;
+    let pairState = base.pairState;
+    let start = 0;
+    for (let target = chunk; target <= cutoff; target += chunk) {
+        const frameEnd = Math.min(items.length, target + tail);
+        const prefix = items.slice(0, frameEnd);
+        const frameReferences = responseReferencedIds(prefix);
+        const classified = summaryCheckpointUnits(items.slice(start, frameEnd),
+            frameReferences, anchor, start, items, summaryDuplicateCallIds(prefix),
+            projectionVersion);
+        for (const unit of classified.units) if (!unit.safe)
+            for (const round of unit.rounds)
+                nativePairReasons.set(round.startIndex, unit.nativeReason ?? 'native_dependency');
+        const crossing = classified.units.filter(unit => unit.start < target && unit.endExclusive > target);
+        const closedThrough = Math.min(target, ...crossing.map(unit => unit.start));
+        const eligible = classified.units.filter(unit => unit.safe && unit.start >= start
+            && unit.endExclusive <= closedThrough);
+        // A later reference changes the semantic dependencies of a sealed
+        // epoch. It is impossible both to preserve that reference natively and
+        // replay its old image unchanged: decline atomically, never repack it.
+        if (eligible.some(unit => unit.indices.some(index =>
+            [items[index]?.id, items[index]?.call_id].some(id =>
+                typeof id === 'string' && referenced.has(id) && !frameReferences.has(id)))))
+            return failSafe('summary_native_reference');
+        const reasoningEpoch = eligible.some(unit => unit.reasoning.length);
+        const runs = [];
+        for (const unit of eligible) {
+            const run = runs.at(-1);
+            if (run && run.at(-1).endExclusive === unit.start
+                && (projectionVersion < 4 || !!run.at(-1).retiredReads === !!unit.retiredReads))
+                run.push(unit);
+            else
+                runs.push([unit]);
+        }
+        let epochSummaries = 0;
+        let epochRemoved = 0;
+        for (const run of runs) {
+            const source = run.map(unit => unit.text).filter(Boolean).join('\n\n');
+            const baselineTokens = run.reduce((n, unit) => n + unit.baselineTokens, 0);
+            const safe = neutralizeSentinel(source);
+            const renderedText = o.reflow ? reflow(safe) ?? safe : safe;
+            const cols = o.reflow ? o.cols : measureContentCols(renderedText, o.cols, o.style?.markerScale, o.style?.font);
+            // Successful old Read output >200 chars is explicitly disposable.
+            // Do not reimpose a 30k history floor or a per-page profit veto here.
+            // The outer cache controller still owns when this version is committed.
+            const retiredReads = projectionVersion >= 4 && run.every(unit => unit.retiredReads);
+            // V5 follows Claude: project completed old tools in this pass, then
+            // let the outer whole-request gate decide whether to commit. A tiny
+            // individual run must not veto a useful complete checkpoint.
+            // Replay older projection versions with their original gates.
+            if (projectionVersion < 5 && !reasoningEpoch && !retiredReads && (baselineTokens < o.minCollapseTokens
+                || (source && typeof isProfitable === 'function'
+                    && !await isProfitable(renderedText, cols, baselineTokens, source))))
+                continue;
+            if (source && imageCount >= maxImages) {
+                return failSafe('summary_image_budget');
+            }
+            const images = source ? await renderTextToPngs(renderedText, cols,
+                o.style ?? DEFAULT_GPT_PROFILE.style, o.maxHeightPx) : [];
+            if ((source && !images.length) || imageCount + images.length > maxImages) {
+                // Atomic fail-safe: never return a shortened/re-rendered old
+                // epoch prefix when a later page exhausts the request budget.
+                return failSafe('summary_image_budget');
+            }
+            const selectedIndices = run.flatMap(unit => unit.indices);
+            segments.push({
+                insertAt: selectedIndices[0], selectedIndices, images,
+                imageSources: images.map(() => source), text: source, baselineTokens,
+            });
+            imageCount += images.length;
+            for (const unit of run) {
+                unit.reasoning.forEach(index => removed.add(index));
+                epochRemoved += unit.reasoning.length;
+                epochSummaries += unit.summaries;
+                selectedRounds.push(...unit.rounds);
+            }
+        }
+        let protectedCount = 0;
+        for (let i = start; i < target; i++)
+            if (items[i]?.type === 'reasoning' && !removed.has(i))
+                protectedCount++;
+        summaryState.epochs.push({ start, target, closedThrough,
+            removed: epochRemoved, summaries: epochSummaries, protected: protectedCount });
+        summaryState.removed += epochRemoved;
+        summaryState.summaries += epochSummaries;
+        summaryState.closedThrough = closedThrough;
+        start = closedThrough;
+    }
+    for (let i = 0; i < cutoff; i++)
+        if (items[i]?.type === 'reasoning' && !removed.has(i))
+            summaryState.protected++;
+    const selectedIndices = segments.flatMap(segment => segment.selectedIndices);
+    const images = segments.flatMap(segment => segment.images);
+    const text = segments.map(segment => segment.text).filter(Boolean).join('\n\n');
+    pairState.collapsedPairs = selectedRounds.reduce((n, round) => n + round.pairs.length, 0);
+    pairState.collapsedFunctionCallTokens = selectedRounds.reduce((n, round) => n + round.callTokens, 0);
+    pairState.collapsedFunctionOutputTokens = selectedRounds.reduce((n, round) => n + round.outputTokens, 0);
+    const selectedCalls = new Set(selectedRounds.flatMap(round => round.pairs.map(pair => pair.callIndex)));
+    summaryState.nativeToolPairReasons = {};
+    for (const round of allPairs.completed) {
+        const remaining = round.pairs.filter(pair => !selectedCalls.has(pair.callIndex)).length;
+        if (!remaining) continue;
+        const reason = round.endIndex >= cutoff ? 'live_tail'
+            : nativePairReasons.get(round.startIndex) ?? 'native_dependency';
+        summaryState.nativeToolPairReasons[reason] = (summaryState.nativeToolPairReasons[reason] ?? 0) + remaining;
+    }
+    const droppedCodepoints = new Map();
+    let droppedChars = 0;
+    for (const image of images) {
+        droppedChars += image.droppedChars;
+        for (const [codepoint, count] of image.droppedCodepoints)
+            droppedCodepoints.set(codepoint, (droppedCodepoints.get(codepoint) ?? 0) + count);
+    }
+    return {
+        ...base, segments, images, imageSources: segments.flatMap(segment => segment.imageSources),
+        selectedIndices, text, baselineTokens: segments.reduce((n, segment) => n + segment.baselineTokens, 0),
+        start: selectedIndices[0] ?? 0, endExclusive: (selectedIndices.at(-1) ?? -1) + 1,
+        collapsedTurns: selectedIndices.length, collapsedChars: text.length, droppedChars, droppedCodepoints,
+        pairState, summaryState, ...(selectedIndices.length ? {} : { reason: 'no_closed_prefix' }),
+    };
+}
 // ---- Chat Completions lowering ----------------------------------------------
 function chatContentToText(content) {
     if (typeof content === 'string')
@@ -1046,28 +1769,26 @@ function chatContentToText(content) {
             if (typeof txt === 'string')
                 parts.push(txt);
         }
-        else if (t === 'image_url' || t === 'input_image' || t === 'image') {
-            parts.push('[image]');
+        else if (isHistoryImagePart(p)) {
+            parts.push(imageHistoryMarker(p));
         }
     }
     return parts.join('\n');
 }
-function chatMessageToTurn(msg, idx, ctx) {
+function chatMessageToTurn(msg, idx, ctx, opts) {
     const o = (msg ?? {});
     const role = typeof o.role === 'string' ? o.role : '';
-    const hasImage = Array.isArray(o.content) && o.content.some((part) => {
-        if (!part || typeof part !== 'object')
-            return false;
-        const type = part.type;
-        return type === 'image_url' || type === 'input_image' || type === 'image';
-    });
+    const hasImage = Array.isArray(o.content) && o.content.some(isHistoryImagePart);
+    const unknown = Array.isArray(o.content) && o.content.some((p) =>
+        !p || (p.type !== 'text' && !isHistoryImagePart(p)) || (p.type === 'text' && typeof p.text !== 'string'));
+    const opaque = unknown || isRenderedGptContext(o) || (hasImage && !opts.collapseImages);
     const body = chatContentToText(o.content);
     if (role === 'tool') {
         const id = typeof o.tool_call_id === 'string' ? o.tool_call_id : '';
         const raw = `[tool_result]\n${body}`;
-        if (ctx?.dropTools && !hasImage) {
+        if (ctx?.dropTools && !opaque) {
             return {
-                text: keptToolOutput(ctx.names.get(id) ?? 'tool', body),
+                text: keptToolOutput(ctx.names.get(id) ?? 'tool', body) || imageHistoryNotes(o.content),
                 rawText: raw,
                 openIds: [],
                 closeIds: id ? [id] : [],
@@ -1078,7 +1799,7 @@ function chatMessageToTurn(msg, idx, ctx) {
             text: raw,
             openIds: [],
             closeIds: id ? [id] : [],
-            opaque: hasImage,
+            opaque,
         };
     }
     if (role === 'assistant') {
@@ -1111,17 +1832,17 @@ function chatMessageToTurn(msg, idx, ctx) {
             rawText: ctx?.dropTools && rawJoined.trim() ? `<assistant t="${idx}">\n${rawJoined}\n</assistant>` : undefined,
             openIds,
             closeIds: [],
-            opaque: hasImage,
+            opaque,
         };
     }
     if (!body.trim())
-        return { text: '', openIds: [], closeIds: [], opaque: hasImage };
+        return { text: '', openIds: [], closeIds: [], opaque };
     const tag = role === 'user' ? 'user' : role || 'user';
     return {
         text: `<${tag} t="${idx}">\n${body}\n</${tag}>`,
         openIds: [],
         closeIds: [],
-        opaque: hasImage,
+        opaque,
         userText: role === 'user' ? body : undefined,
     };
 }
@@ -1138,7 +1859,7 @@ export function chatMessagesToTurns(messages, opts = {}) {
         }
         ctx = { dropTools: true, names, seen: new Set() };
     }
-    return messages.map((msg, i) => chatMessageToTurn(msg, i, ctx));
+    return messages.map((msg, i) => chatMessageToTurn(msg, i, ctx, opts));
 }
 function responsesItemToTurn(item, idx) {
     const o = (item ?? {});

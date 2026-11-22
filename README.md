@@ -71,7 +71,11 @@ The 2 px row spacing lifted Claude from 84/98 to 93/98 gist (pxpipe `claude-mode
 Terra is enabled at the user's request (2026-11-15) although pxpipe has no quality measurement for it.
 A 4-file Codex check on terra answered every name and a 34-character `cache_id` correctly; that is one run, not a benchmark, and it ran under the earlier 14px profile.
 gpt-6.1-luna still passes through.
-pxlite strips `prompt_cache_breakpoint` from Responses requests because both the ChatGPT backend and api.openai.com reject it for Sol.
+Responses cache compatibility is backend-specific: both public OpenAI Responses and
+Codex/ChatGPT remove pxpipe's unsupported `prompt_cache_breakpoint` anchor for Sol.
+Tool schema properties with the same name are never stripped.
+A caller explicitly selecting explicit-only mode is left intact rather than silently
+disabling its caching; an unsupported backend can still reject that configuration.
 The data-stays-text filter (`keepSharp`) exists only on pxpipe's Anthropic path; GPT history is imaged without it.
 `PXLITE_CACHE_TTL` (default `1h`): cache markers that arrive without a `ttl` (OpenCode sends none, so
 Anthropic used 5 minutes) get this ttl. Measured on 928 OpenCode requests: the 42 that came after a 5 to 60 minute
@@ -154,8 +158,10 @@ Details, raw numbers and rebuild steps: `vi-eval/RESULTS.md`.
 
 ## Limits
 
-- Old history turns are collapsed into images as one block; pxpipe exposes no per-block hook there.
-  Those pages carry pxpipe's exact-value factsheet and an instruction to re-read sources for exact numbers.
+- Claude's imaged history has no per-tool data-classification hook inside it.
+  GPT uses separate frozen messages with a local exact-value factsheet per section,
+  rather than moving a combined factsheet whenever another section is added.
+  Those pages carry an instruction to re-read sources for exact numbers.
 - Memory floor is ~100–120 MB at idle (pxpipe's fonts and tokenizer); an 80-turn simulated session peaked near 245 MB RSS with a 16 MB JS heap.
   Windows trims the working set of an idle proxy to a few MB.
 - `pxclaude` sets `HTTPS_PROXY` to port 47822 instead of using `pxpipe warp`, which on Windows drops quoted arguments and cannot spawn `claude` from PowerShell (`ENOENT`).
@@ -166,3 +172,178 @@ Details, raw numbers and rebuild steps: `vi-eval/RESULTS.md`.
 Tests: `npm test` (`node --test test.mjs test-recall-sessions.mjs test-opencode-session.mjs test-serve.mjs`; needs the built `vendor/`).
 
 - `PXLITE_TOOL_ROUND_CUT=0` turns off cutting between matched call/result pairs in a tool chain; `PXLITE_TOOL_ROUND_KEEP_TAIL` (default 12) is the live tail kept in a chain. An open tool_use is never cut. Test: `test-tool-round-cut.mjs`.
+
+### GPT Responses: sealed summary history
+
+Managed GPT Responses default to `PXLITE_GPT_REASONING_MODE=summary`. At original
+client-input checkpoints (`PXLITE_GPT_CHECKPOINT_CHUNK=130`), safely closed old
+reasoning is replaced by its **existing public summary**, packed with useful
+user/assistant text and GPT tool transcripts into shared history pages. Ciphertext
+is never decoded, OCR'd, rendered, or counted as BPE text. Empty public summaries
+do not invent a reconstruction of the reasoning. There is no separate reservoir
+of 50 old reasoning blobs in this mode.
+
+`PXLITE_GPT_NATIVE_TAIL=30` is the minimum original-input live tail, not 30 tool
+rounds and not a sliding maximum. It can grow between checkpoints, and dependency
+protection expands it for pending/parallel/malformed/referenced native state.
+Completed old Read/success output bodies follow GPT's existing omission policy;
+source breadcrumbs, errors, actual subagent reports and continuation handles
+survive. Typed child thinking is not imported as a subagent report.
+
+Each source epoch is rendered independently. Closing a later epoch appends pages;
+it never fills, repacks or moves an older page's image bytes/factsheet. Static
+slab insertion does not affect checkpoint counts. First-user task anchors,
+authoritative instructions, original client pixels, rendered recall and unknown
+protocol payloads retain native protection. An imaged current task gets a live
+native-text guard at the suffix, not a mutable instruction in old pages.
+
+The economic gate prices the shared closed prefix separately from the rewritten
+suffix. Known preserved-prefix credit is capped by provider-observed cache usage;
+unexplained usage offsets remain conservative, not a guessed ciphertext token
+count. Every transition, including retiring old reasoning, must pass the same
+economic gate; there is no forced `reasoning_checkpoint` acceptance. If the
+ciphertext savings cannot be measured and visible savings do not cover the cache
+reload estimate, keep the previous archive and defer the whole transition.
+Context safety is a separate override: summary mode uses
+`PXLITE_FORCE_COLLAPSE_TOKENS` (default 180000; `0` disables), considering provider
+input usage and the calibrated current estimate. Over budget, a different valid
+candidate may commit despite failed payback when it cuts at least 4096 visible
+tokens / 2%, or retires at least 30 and half the remaining opaque items without
+increasing the visible estimate. Tiny or unchanged checkpoints cannot force a
+reload. This is logged as `context_budget`, `budget_forced:true`,
+`economic_accept:false`; opaque savings remain explicitly unknown. The guard is
+not a guarantee that protected native images/dependencies will fit under 180k.
+Measure future input/cache and new reasoning to evaluate the trade-off.
+
+Known assistant phases (`commentary`, `final_answer`) are transcribed with their
+phase rather than pinning a completed reasoning/tool group native. Projection
+version 3 also handles completed interleaved tool intervals, synchronous/direct
+caller metadata, named tool outputs, empty assistant wrappers and nullable
+ciphertext with known reasoning content. Program/async dependencies, unknown
+fields and malformed calls remain native. Namespaced tools keep their qualified
+identity; subagent reports/handles survive and parallel wrappers retain each child
+breadcrumb. Versions 1, 2 and 3 remain replayable byte-for-byte when the economic
+gate rejects an upgrade. `nativeFunctionPairReasons` reports fixed reason counts.
+
+Projection version 4 retires successful old local Read output strictly longer
+than 200 characters, without requiring a later read of the same range. It keeps
+the exact path and supplied offset/limit (including offset 0) as a re-read
+breadcrumb, not the old file body. These Read-only runs do not wait for the
+30k history-token floor or a per-page profitability check. Live-tail, image,
+reference and protocol protections still apply; the outer cache controller owns
+when the v4 layout is committed. A rejected migration replays the old layout
+unchanged. Re-reading retrieves the current file, not necessarily its historical
+contents.
+
+Projection version 5 follows Claude's two-stage principle on managed Responses:
+successful old tool results are projected into breadcrumbs in the same request
+that renders history. The projector no longer independently vetoes each small run
+with a 30k/per-page gate; the outer gate evaluates the complete outgoing candidate,
+including image and exact-value text costs. Read's >200-character rule is unchanged.
+Versions 1–4 remain replayable; an upgrade does not silently rewrite sealed pages.
+
+Safe closed reasoning may be retired while keeping its public summary, but opaque
+retirement alone no longer overrides a financial rejection below the context
+budget. Empty summaries do not acquire fabricated text or ciphertext images.
+The separate 180k context guard remains explicit, not claimed financial savings.
+Live tool dependencies, referenced items and unknown shapes remain native.
+
+V5 cache economics use the current session's last observed cache ratio and a
+conservative sample of its three latest cache ratios for future reads, rather
+than assuming every future read hits. After three consecutive observed zero-hit
+responses, a layout change must pay immediately without future cache reuse
+(`cache_recovery_unproven` otherwise); context safety remains a separate override.
+Unchanged layouts are still replayed. Health evidence survives restart in safe
+numeric seeds and is isolated by model, route and session. This does not diagnose
+or repair provider cache eligibility; a stable local prefix is necessary evidence,
+not a guarantee of a provider hit. Claude's marker placement remains unchanged.
+
+For summary mode, the expected number of future reads uses the lower quartile of
+at least three completed original-source checkpoint windows. The first partial
+window, skipped/reversed windows and other sessions are not credited. Until this
+evidence exists, V5 uses Claude's planning horizon of 10 reads
+(`PXLITE_HISTORY_HORIZON` can set the fallback); older versions retain the
+rewrite-run estimate. The fallback is an assumption, not observed future usage.
+This avoids inheriting a
+broken old projector's rewrite frequency as the lifetime of the new fixed-grid
+layout. Historical full cache misses still price rewrites pessimistically. The
+forecast is logged with `horizon_basis`/`source_epoch_samples` and remains an
+estimate, not a promise of a cache hit or a particular bill.
+
+Settings: `PXLITE_GPT_REASONING_MODE=native` restores the earlier cache-gated
+historical cap (`PXLITE_GPT_REASONING_KEEP=50`). `PXLITE_GPT_CACHE_GATE=0` restores
+the legacy Responses path. Claude and legacy Chat are unchanged. The managed path
+has no independently advancing destructive tool checkpoint.
+
+Events contain content-free `gpt_cache_gate`/`gpt_prefix` diagnostics, counts, and a
+closed-prefix hash. Session/model/route, source-root and policy versions are
+isolated. Raw prompts, pixels, ciphertext and credentials are not logged by these
+diagnostics. New back-references, old input edits, settings or hard image/byte
+limits can require a reset/fail-safe; protocol validity and original pixels win
+over cache preservation. A native fallback is never committed as a sealed epoch.
+
+`reasoning_output_tokens`, when provided, is a subset of `output_tokens` and
+measures new generation, **not** replayed opaque input. Missing is unknown.
+No image-reading reminder is injected into the live request on Claude or GPT.
+The legacy `PXLITE_READ_NOTE` setting is ignored, including custom values.
+Tests cover protocol/bytes using local fixtures, not paid model calls; they do not
+prove inference-quality equivalence after this deliberately lossy compaction.
+
+### GPT client images at history checkpoints
+
+On managed Responses, original client image pixels stay native, not `[image]`.
+On legacy Chat/Responses, old client images no longer form permanent history
+barriers. Only turns selected by a history checkpoint lose their
+pixels. Their rendered history contains `[image]`, or an image source marker when
+the request supplies a path, URL or file id. The adjacent tool-call line keeps a
+Read path. Inline base64 is never rendered as transcript text. This does not save
+inline images to disk or invent a path; re-reading still needs an existing source.
+
+The recent tail stays native. Short/unprofitable requests and unselected turns are
+unchanged. There is no rolling 15-image window and no automatic reattachment of old
+pixels. Existing frozen sections remain identical as later turns are appended.
+
+The proxy's own system/tool slab and recall images still contain indispensable
+rendered text, so those images stay native. Unknown payloads (for example files or
+audio), referenced Responses items and unresolved tool calls retain their protocol
+guards. Responses custom tool image outputs use the same tool-chain tail floors
+as function outputs. Tests: `test-gpt-image-collapse.mjs`.
+
+The separate tool-output checkpoint's step of 50 counts **all** `messages`/`input`
+items, not eligible tool results. While its cache is warm it also requires enough
+saved characters (default 40,000); the first cold request or an expired cache may
+advance directly to the tail boundary. It does not guarantee a cut every 50 items.
+
+### GPT cache contract
+
+- Tool-result checkpoints also cover canonical `/v1/responses`,
+  `/v1/chat/completions` and Codex `/backend-api/codex/responses`, not only
+  `opencode.ai/inference/openai`. A stable session id is required. Model and wire
+  shape are isolated, and a child session's own id wins over a shared affinity key.
+- Managed GPT history advances on fixed input-item epochs:
+  `PXLITE_GPT_CHECKPOINT_CHUNK` defaults to `130` (`0` disables this epoch rule).
+  A chunk-size upgrade waits 130 new source items from the held cutoff and replays
+  old pages with their original options until the new candidate is approved.
+  Summary Responses keeps at least 30 source items native and waits for a full
+  source grid; it does not force-bootstrap a short context. Legacy/native mode
+  keeps the earlier 12-item / 6-pair floors and force rule.
+- Chat and Responses keep both PNG bytes and exact-value text in their original
+  frozen sections. New sections append; old factsheets do not migrate.
+- Compaction requests retain complete tool outputs and skip these checkpoints.
+  Turning tool-result collapse off does not turn history epoch protection off.
+- No rule treats GPT `cache_write_tokens: 0` as proof that cache is empty.
+  A checkpoint/model/settings change or upstream routing can still cause a miss;
+  this is not a promise of 100% cache hits.
+- A changed summary wire is priced as a full cache miss: equal JSON items are not
+  proof that a backend reuses that prefix. History also requires at least 40,000
+  **visible native-text characters saved** before advancing an existing epoch,
+  in addition to the token/payback gate. Ciphertext/base64 do not count. Neither
+  opaque reasoning retirement nor the 180k context-budget guard bypasses this
+  floor. Cold bootstrap and unchanged-wire replay do not incur a new warm rewrite.
+  Claude's separate tool-result 50-item checkpoint policy is unchanged.
+- The image cap and geometry are unchanged. When a cap is reached, unselected
+  context remains native rather than silently disappearing. Total context includes
+  cached tokens; a large cached context is not the same as a large uncached input.
+
+Regression tests: `test-gpt-cache-contract.mjs` and the local-upstream serve tests
+compare complete frozen messages and verify the real route/compatibility pipeline.
