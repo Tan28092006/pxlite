@@ -135,6 +135,26 @@ Details, raw numbers and rebuild steps: `vi-eval/RESULTS.md`.
 - **The log is capped.**
   `~/.pxpipe/events.jsonl` rotates at 50 MB into one `.1` backup (100 MB at most); files untouched for 14 days are deleted.
   Override with `PXLITE_LOG_MAX_BYTES` and `PXLITE_LOG_MAX_DAYS`; request-body samples are never logged.
+  GPT (`gpt-*`, `oN*`, including `openai/` aliases) event serialization is compact
+  by default; `PXLITE_LOG_DETAIL=full` retains the previous full diagnostic fields
+  (still subject to existing body-sample removal/error-body limits). Claude logs
+  are unchanged. This setting changes neither requests nor cache decisions.
+  Usage zeros, timing, session hashes, prefix position/counts, checkpoint
+  held/candidate/chosen cutoffs and decision reasons remain. `chosen_options`
+  and numeric/hash recovery metadata deliberately repeat: standalone lines must
+  restore cache policy after rotation/restart. Policy records full events first.
+  Redundant token/cost estimates, environment snapshots and known no-op fields
+  are omitted; unknown diagnostics, errors and upstream IDs pass through.
+  Offline GPT analyzers must tolerate absent estimates/no-op fields rather than
+  treating missing usage as zero; estimate-based savings need full logs.
+  `scripts/cost-report.mjs` reads Claude only; recall reads session transcripts,
+  not these GPT events. Cache-policy seed/restore uses unchanged required keys.
+  `gpt_prefix_diff` normally contains only counts/completeness (no hashes or
+  change arrays); rewrite/truncate/unknown also include changed block sizes and
+  at most eight positional details. `reported_changes` counts emitted details;
+  `details_omitted` marks intentional routine suppression, while `truncated`
+  preserves source truncation and marks capped diagnostic lists. Incomplete
+  totals remain retained-position lower bounds, not semantic diff totals.
 - **Compaction stays text.**
   A Claude Code compaction request (`/compact` or auto-compact) is sent without images, because the summary is what the next session lives on.
   One test read from history images kept a superseded Codex setup as the final one (`compact-eval/RESULTS.md`).
@@ -176,7 +196,7 @@ Tests: `npm test` (`node --test test.mjs test-recall-sessions.mjs test-opencode-
 ### GPT Responses: sealed summary history
 
 Managed GPT Responses default to `PXLITE_GPT_REASONING_MODE=summary`. At original
-client-input checkpoints (`PXLITE_GPT_CHECKPOINT_CHUNK=130`), safely closed old
+client-input checkpoints (`PXLITE_GPT_CHECKPOINT_CHUNK=160`), safely closed old
 reasoning is replaced by its **existing public summary**, packed with useful
 user/assistant text and GPT tool transcripts into shared history pages. Ciphertext
 is never decoded, OCR'd, rendered, or counted as BPE text. Empty public summaries
@@ -321,8 +341,8 @@ advance directly to the tail boundary. It does not guarantee a cut every 50 item
   `opencode.ai/inference/openai`. A stable session id is required. Model and wire
   shape are isolated, and a child session's own id wins over a shared affinity key.
 - Managed GPT history advances on fixed input-item epochs:
-  `PXLITE_GPT_CHECKPOINT_CHUNK` defaults to `130` (`0` disables this epoch rule).
-  A chunk-size upgrade waits 130 new source items from the held cutoff and replays
+  `PXLITE_GPT_CHECKPOINT_CHUNK` defaults to `160` (`0` disables this epoch rule).
+  A chunk-size upgrade waits 160 new source items from the held cutoff and replays
   old pages with their original options until the new candidate is approved.
   Summary Responses keeps at least 30 source items native and waits for a full
   source grid; it does not force-bootstrap a short context. Legacy/native mode

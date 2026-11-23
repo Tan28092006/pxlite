@@ -153,8 +153,8 @@ const readEvents = (home) => {
 const chatBody = JSON.stringify({ model: 'deepseek-v4.1-flash-free', messages: [{ role: 'user', content: 'hello opencode' }] });
 const headers = { 'content-type': 'application/json', authorization: 'Bearer test' };
 
-test('real GPT upstream event correlates headers and hashes cache identity without storing prompt text', { skip: SKIP }, async t => {
-  const { base, home } = await startServe(t, { PXPIPE_MODELS: 'gpt-6.1-sol' });
+for (const detail of ['compact', 'full']) test(`real GPT upstream event correlates headers and hashes cache identity without storing prompt text (${detail})`, { skip: SKIP }, async t => {
+  const { base, home } = await startServe(t, { PXPIPE_MODELS: 'gpt-6.1-sol', PXLITE_LOG_DETAIL: detail });
   const res = await fetch(base + '/v1/responses', { method: 'POST',
     headers: { ...headers, 'x-opencode-session-id': 'diagnostic-fixture' },
     body: JSON.stringify({ model: 'gpt-6.1-sol', prompt_cache_key: 'PRIVATE-CACHE-KEY',
@@ -166,7 +166,7 @@ test('real GPT upstream event correlates headers and hashes cache identity witho
     events = readEvents(home); if (!events.length) await sleep(100);
   }
   assert.equal(events[0]?.gpt_upstream?.request_id, 'req_fixture_1');
-  assert.equal(events[0].gpt_upstream.anchors, 0);
+  assert.equal(events[0].gpt_upstream.anchors, detail === 'full' ? 0 : undefined);
   assert.match(events[0].gpt_upstream.cache_key_sha, /^[a-f0-9]{24}$/);
   assert.ok(!JSON.stringify(events).includes('PRIVATE-'));
 });
@@ -283,6 +283,7 @@ test('legacy GPT gate-off routes run tool checkpoints and hold old output bytes 
 
 test('managed GPT proxy logs the outgoing prefix and defers an unprofitable checkpoint atomically', { skip: SKIP }, async (t) => {
   const { base, seen, home } = await startServe(t, {
+    PXLITE_LOG_DETAIL: 'compact',
     PXLITE_RECALL: '0', PXPIPE_MODELS: 'gpt-6.1-sol', PXLITE_READ_NOTE: '0',
     PXLITE_GPT_REASONING_MODE: 'native',
     PXLITE_GPT_CHECKPOINT_CHUNK: '50',
@@ -331,7 +332,9 @@ test('managed GPT proxy logs the outgoing prefix and defers an unprofitable chec
   assert.equal(events[2].gpt_cache_gate.accept, false);
   assert.equal(events[2].gpt_cache_gate.reason, 'cache_payback');
   assert.equal(events[1].reasoning_output_tokens, 1);
-  assert.ok(events.every(e => e.tool_collapse.mode === 'history_cache_gate'));
+  assert.ok(events.every(e => e.tool_collapse === undefined));
+  assert.ok(events.every(e => e.gpt_cache_gate.session === events[0].gpt_cache_gate.session));
+  assert.ok(events.every(e => e.gpt_prefix_diff && !('changes' in e.gpt_prefix_diff)));
   const raw = fs.readFileSync(path.join(home, '.pxpipe', 'events.jsonl'), 'utf8');
   assert.ok(!raw.includes('PRIVATE_OPAQUE_'));
   assert.ok(!raw.includes('PRIVATE_MANAGED_SESSION'));

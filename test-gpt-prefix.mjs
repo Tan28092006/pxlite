@@ -415,3 +415,154 @@ test('reports expose neither payload, hashes, identifiers nor mutable internal s
   b.input[0].content[1].image_url += '-again';
   assert.equal(t.observe(b, c).first_changed.part.before_type, 'input_image');
 });
+
+test('opt-in diff preserves legacy classification and detects simultaneous options, system text and image changes', () => {
+  const t = tracker({ includeDiff: true });
+  const legacy = tracker();
+  const b = { tool_choice: 'auto', input: [
+    { role: 'system', content: [
+      { type: 'input_text', text: 'SECRET-system' },
+      { type: 'input_image', image_url: 'data:image/png;base64,SECRET-image' },
+    ] }, message('SECRET-user'),
+  ] };
+  const first = t.observe(b, context);
+  legacy.observe(b, context);
+  assert.equal(first.diff.has_baseline, false);
+  assert.equal(first.diff.after['system/developer'].images, 1);
+  b.tool_choice = 'required';
+  b.input[0].content[0].text += '-new';
+  b.input[0].content[1].image_url += '-new';
+  const { diff, ...report } = t.observe(b, context);
+  assert.deepEqual(report, legacy.observe(b, context));
+  assert.equal(report.first_changed.area, 'tool_choice');
+  assert.deepEqual(diff.totals, { top: 1, items: 1, parts: 2 });
+  assert.equal(diff.total_changes, 4);
+  assert.equal(diff.complete, true);
+  for (const c of ['system/developer', 'tools/options'])
+    assert.notEqual(diff.before[c].hash, diff.after[c].hash);
+  assert.equal(diff.before['user/assistant'].hash, diff.after['user/assistant'].hash);
+  assert.deepEqual(diff.changes.filter(c => c.kind === 'parts').map(c => c.index), [0, 1]);
+  const item = diff.changes.find(c => c.kind === 'items');
+  assert.equal(item.after.role, 'system');
+  assert.equal(item.after.content_parts, 2);
+  assert.equal(item.after.images, 1);
+  assert.ok(item.after.nodes > 0);
+  assert.ok(item.after.string_units > 0);
+  for (const entry of diff.changes) {
+    assert.match(entry.before.hash, /^[a-f0-9]{64}$/);
+    assert.notEqual(entry.before.hash, entry.after.hash);
+  }
+  assert.doesNotMatch(JSON.stringify(diff), /SECRET|data:image|required|session-secret/);
+});
+
+test('diff tracks append, rewrite, removed/added content and output parts without semantic alignment', () => {
+  const t = tracker({ includeDiff: true });
+  const b = { input: [message('a'), { type: 'function_call_output', output: ['old', 'removed'] }] };
+  t.observe(b, context);
+  b.input.push({ role: 'assistant', content: 'new' });
+  let r = t.observe(b, context);
+  assert.equal(r.status, 'append_only');
+  assert.deepEqual(r.diff.totals, { top: 0, items: 1, parts: 1 });
+  assert.equal(r.diff.changes[0].before, null);
+  assert.equal(r.diff.changes[0].after.role, 'assistant');
+  b.input[0].content.push({ type: 'input_image', image_url: 'secret' });
+  b.input[1].output.pop();
+  b.input[1].output[0] = 'rewrite';
+  r = t.observe(b, context);
+  assert.equal(r.status, 'rewrite');
+  assert.deepEqual(r.diff.totals, { top: 0, items: 2, parts: 3 });
+  const parts = r.diff.changes.filter(c => c.kind === 'parts');
+  assert.equal(parts[0].area, 'content');
+  assert.equal(parts[0].before, null);
+  assert.equal(parts[1].category, 'call/output');
+  assert.equal(parts[2].after, null);
+  b.input.pop();
+  r = t.observe(b, context);
+  assert.equal(r.status, 'truncate');
+  assert.equal(r.diff.changes[0].after, null);
+  assert.equal(r.diff.alignment, 'positional');
+});
+
+test('diff caps all change lists together but retains complete totals and category block fingerprints', () => {
+  const t = tracker({ includeDiff: true, maxDiffEntries: 1 });
+  const b = { tool_choice: 'auto', input: Array.from({ length: 20 }, () => message('a')) };
+  t.observe(b, context);
+  b.tool_choice = 'required';
+  for (const item of b.input) item.content[0].text = 'b';
+  const r = t.observe(b, context);
+  assert.equal(r.status, 'rewrite');
+  assert.equal(r.diff.changes.length, 1);
+  assert.equal(r.diff.total_changes, 41);
+  assert.equal(r.diff.reported_changes, 1);
+  assert.equal(r.diff.truncated, true);
+  assert.equal(r.diff.complete, true);
+  assert.equal(r.diff.totals_scope, 'all');
+  assert.notEqual(r.diff.before['user/assistant'].hash, r.diff.after['user/assistant'].hash);
+  assert.equal(r.diff.after['user/assistant'].items, 20);
+  assert.equal(r.diff.after['user/assistant'].parts, 20);
+  assert.ok(JSON.stringify(r.diff).length < 10000);
+  const limited = tracker({ includeDiff: true, maxUnits: 2, maxDiffEntries: 0 });
+  limited.observe(b, context);
+  const d = limited.observe(b, context).diff;
+  assert.equal(d.complete, false);
+  assert.equal(d.totals_scope, 'retained_positions');
+  assert.equal(d.truncated, true);
+  assert.equal(d.after['user/assistant'].items, 1);
+  assert.deepEqual(d.changes, []);
+  for (const options of [{ maxDiffEntries: 257 }, { maxDiffEntries: -1 },
+    { maxDiffEntries: 1.5 }, { includeDiff: 'yes' }])
+    assert.throws(() => tracker(options), TypeError);
+});
+
+test('opt-in diff is getter-safe, detached, private, and never guesses recall/history categories', () => {
+  const t = tracker({ includeDiff: true });
+  const b = { input: [
+    { type: 'SECRET-type', role: 'SECRET-role', content: [{ type: 'SECRET-part', text: 'SECRET-prompt' }] },
+    { type: 'reasoning', encrypted_content: 'SECRET-cipher' },
+    { type: 'function_call', name: 'SECRET-name', call_id: 'SECRET-id',
+      arguments: 'C:\\SECRET-path\\file' },
+  ], 'SECRET-option': 'SECRET-data' };
+  t.observe(b, context);
+  b.input[0].content[0].text += 'changed';
+  b.input[1].encrypted_content += 'changed';
+  b.input[2].arguments += 'changed';
+  b['SECRET-option'] += 'changed';
+  const r = t.observe(b, context);
+  assert.doesNotMatch(JSON.stringify(r), /SECRET|C:\\|session-secret|recall|history/);
+  assert.equal(r.diff.changes.find(c => c.kind === 'items').after.category, 'unknown');
+  assert.ok(r.diff.after.reasoning.items);
+  assert.ok(r.diff.after['call/output'].items);
+  r.diff.after.reasoning.hash = 'corrupt';
+  r.diff.changes.find(c => c.kind === 'items').after.hash = 'corrupt';
+  assert.equal(t.observe(b, context).status, 'unchanged');
+  let calls = 0;
+  Object.defineProperty(b.input[0], 'extra', {
+    enumerable: true, get() { calls++; throw Error('SECRET-getter'); },
+  });
+  const bad = t.observe(b, context);
+  assert.equal(bad.reason, 'invalid_body');
+  assert.equal(bad.diff, null);
+  assert.equal(calls, 0);
+  assert.equal(t.observe({ input: [] }, context).status, 'first');
+});
+
+test('format switch explicitly declines positional alignment', () => {
+  const t = tracker({ includeDiff: true });
+  t.observe({ input: [message('a')] }, context);
+  const r = t.observe({ messages: [message('b')] }, context);
+  assert.equal(r.first_changed.area, 'input_format');
+  assert.equal(r.diff.complete, false);
+  assert.equal(r.diff.totals_scope, 'retained_positions');
+  assert.equal(r.diff.truncated, true);
+});
+
+test('unretained positions are unknown rather than spurious additions or removals', () => {
+  const t = tracker({ includeDiff: true, maxUnits: 3 });
+  const b = { input: [message('a'), message('b')] };
+  t.observe(b, context); // second item retained, its content part is not
+  b.input[0].content = []; // frees budget to retain the second content part
+  const r = t.observe(b, context);
+  assert.equal(r.diff.complete, false);
+  assert.equal(r.diff.totals.parts, 1, 'only the actual first-item removal is known');
+  assert.equal(r.diff.changes.filter(c => c.kind === 'parts')[0].parent_index, 0);
+});

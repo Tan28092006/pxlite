@@ -26,6 +26,7 @@ import { createRecallSessions } from './recall-sessions.mjs';
 import { createGptCachePolicy, toGptCacheSeedEvent } from './gpt-cache-policy.mjs';
 import { createGptPrefixTracker } from './gpt-prefix.mjs';
 import { describeGptUpstream, describeGptResponse } from './gpt-upstream-diagnostics.mjs';
+import { projectGptEvent } from './gpt-event-log.mjs';
 
 // Set by serve() when recall is enabled; used by toWebRequest on request bodies.
 let recall = null; // OpenCode, Responses
@@ -34,7 +35,7 @@ let chatRecall = null; // OpenCode providers on Chat Completions (opencode/*, e.
 let claudeToolCollapse = null; // old successful Bash/Edit/Write results (collapse-tools.mjs)
 let claudeDedupe = null; // repeated injected blocks in Claude Messages (dedupe-blocks.mjs)
 let gptCachePolicy = null;
-const gptPrefixes = createGptPrefixTracker();
+const gptPrefixes = createGptPrefixTracker({ includeDiff: true });
 
 // Per-request flags read by proxyConfig.transform(), which pxpipe calls with no
 // arguments inside the request's async context.
@@ -305,8 +306,8 @@ async function toWebRequest(req) {
         const report = {};
         const wire = Array.isArray(parsed?.input) ? 'responses' : 'chat';
         const supportedGpt = /^(?:openai\/)?(?:gpt-|o\d)/i.test(parsed.model ?? '');
-        const configuredChunk = Number.parseInt(process.env.PXLITE_GPT_CHECKPOINT_CHUNK ?? '130', 10);
-        const checkpointChunk = Number.isFinite(configuredChunk) && configuredChunk >= 0 ? configuredChunk : 130;
+        const configuredChunk = Number.parseInt(process.env.PXLITE_GPT_CHECKPOINT_CHUNK ?? '160', 10);
+        const checkpointChunk = Number.isFinite(configuredChunk) && configuredChunk >= 0 ? configuredChunk : 160;
         const summaryMode = process.env.PXLITE_GPT_REASONING_MODE !== 'native';
         const sourceKey = summaryMode && wire === 'responses'
           ? createHash('sha256').update(JSON.stringify([
@@ -594,7 +595,7 @@ async function serve() {
       try {
         const row = { ...toTrackEvent(e), ...requestCtx.getStore()?.tags };
         requestCtx.getStore()?.gptPolicy?.record(row);
-        log.write(slimEvent(row));
+        log.write(projectGptEvent(slimEvent(row), { detail: process.env.PXLITE_LOG_DETAIL }));
       } catch (err) {
         console.warn(`[pxlite] event log write failed: ${err.message}`);
       }
@@ -628,12 +629,13 @@ async function serve() {
     if (init?.body && store?.gptPrefixContext && /\/(?:responses|chat\/completions)(?:\?|$)/.test(url ?? '')) {
       try {
         const json = typeof init.body === 'string' ? init.body : new TextDecoder().decode(init.body);
-        const report = gptPrefixes.observe(JSON.parse(json), {
+        const { diff, ...report } = gptPrefixes.observe(JSON.parse(json), {
           ...store.gptPrefixContext, route: new URL(url).origin + new URL(url).pathname });
-        store.tags = { ...store.tags, gpt_prefix: report,
+        store.tags = { ...store.tags, gpt_prefix: report, gpt_prefix_diff: diff,
           gpt_upstream: describeGptUpstream(url, json) };
       } catch {
-        store.tags = { ...store.tags, gpt_prefix: { status: 'unknown', reason: 'invalid_body' } };
+        store.tags = { ...store.tags, gpt_prefix: { status: 'unknown', reason: 'invalid_body' },
+          gpt_prefix_diff: null };
       }
     }
     const response = await nativeFetch(input, init);

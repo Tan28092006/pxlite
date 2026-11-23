@@ -5,6 +5,22 @@ import { createHash } from 'node:crypto';
  *
  * API: createGptPrefixTracker({ now = Date.now, maxSessions = 64,
  *   maxUnits = 4096, ttlMs = 3600000 } = {}).observe(body, { sessionKey, route } = {})
+ * Optional includeDiff=true adds a detached `diff` (null on failed observation).
+ * maxDiffEntries (default 64, hard maximum 256) bounds shared top/item/part
+ * change entries. Default report keys and classification remain unchanged.
+ * Diff hashes are exact structured SHA-256 fingerprints, not cache-hit evidence.
+ * Unknown top fields remain a single "other" bucket; excluded stream/token
+ * controls remain ignored. No recall/history inference is attempted.
+ * Aggregate blocks cover top fields and retained items (including their nested
+ * parts), even when the change list is capped. `complete=false` means totals
+ * are retained-position lower bounds, not full-request totals; input/messages
+ * format switches are deliberately not aligned. First observations have no
+ * baseline and report aggregates only. Positional changes are NOT semantic
+ * alignment: insertions can make every following position differ.
+ * `nodes` counts JSON value nodes; `string_units` counts UTF-16 value units
+ * (not keys). Neither measures wire bytes/tokens. `images` counts typed native
+ * image objects, not decoded images or untyped URLs. Hashes can reveal equality
+ * and permit guessing low-entropy values; they are not anonymization.
  *
  * Report (all keys always present):
  *   status: first | unchanged | append_only | rewrite | truncate | unknown
@@ -108,7 +124,7 @@ function nativeType(value) {
 // reasoning.encrypted_content), no whole-body serialization, no retained text.
 // UTF-16 code units preserve even distinct unpaired surrogates. JSON numbers
 // follow native JSON semantics, i.e. -0 and 0 have the same representation.
-function digest(value, rootKeys) {
+function digest(value, rootKeys, stats) {
   const hash = createHash('sha256');
   const active = new Set();
   let nodes = 0;
@@ -119,6 +135,10 @@ function digest(value, rootKeys) {
   }
   function visit(current, depth, selectedKeys) {
     if (++nodes > MAX_NODES || depth > MAX_DEPTH) throw LIMIT;
+    if (stats) {
+      stats.nodes++;
+      if (typeof current === 'string') stats.string_units += current.length;
+    }
     if (current === null) { hash.update('z'); return; }
     switch (typeof current) {
       case 'string': string(current); return;
@@ -140,6 +160,7 @@ function digest(value, rootKeys) {
       for (let i = 0; i < current.length; i++) visit(own(current, String(i)), depth + 1);
     } else {
       if (!isRecord(current)) throw INVALID;
+      if (stats && IMAGE_TYPES.has(own(current, 'type'))) stats.images++;
       const keys = selectedKeys ?? Object.keys(current);
       if (keys.length > MAX_NODES) throw LIMIT;
       hash.update(`o${keys.length}:`);
@@ -179,17 +200,46 @@ function countItems(body) {
   }
 }
 
-function snapshot(body, description, maxUnits) {
+const IMAGE_TYPES = new Set(['input_image', 'image_url', 'image']);
+const CATEGORIES = Object.freeze([
+  'system/developer', 'tools/options', 'reasoning', 'call/output',
+  'user/assistant', 'unknown',
+]);
+
+function category(type, role) {
+  if (role === 'system' || role === 'developer') return 'system/developer';
+  if (type === 'reasoning' || type === 'reasoning_text' || type === 'summary_text') return 'reasoning';
+  if (role === 'tool' || role === 'function' || type.includes('call') ||
+    type === 'tool_use' || type === 'tool_result') return 'call/output';
+  if (role === 'user' || role === 'assistant') return 'user/assistant';
+  return 'unknown'; // Never infer recall/history from text, paths, IDs or images.
+}
+
+function topCategory(field) {
+  if (field === 'instructions' || field === 'system') return 'system/developer';
+  if (field === 'reasoning') return 'reasoning';
+  return 'tools/options';
+}
+
+function fingerprint(value, type, details, rootKeys) {
+  const stats = details ? { nodes: 0, string_units: 0, images: 0 } : undefined;
+  const hash = digest(value, rootKeys, stats);
+  if (stats) stats.value_count = Array.isArray(value) ? value.length :
+    value !== null && typeof value === 'object' ? (rootKeys ?? Object.keys(value)).length : null;
+  return { hash, type, ...(stats ?? {}) };
+}
+
+function snapshot(body, description, maxUnits, details) {
   const result = {
     kind: description.kind, count: description.entries.length,
     top: [], items: [], truncated: false,
   };
   for (const field of TOP_FIELDS) {
     const value = own(body, field);
-    result.top.push(value === ABSENT ? null : { hash: digest(value), type: jsonType(value) });
+    result.top.push(value === ABSENT ? null : fingerprint(value, jsonType(value), details));
   }
   const otherKeys = Object.keys(body).filter(key => !EXCLUDED.has(key));
-  result.top.push(otherKeys.length ? { hash: digest(body, otherKeys), type: 'object' } : null);
+  result.top.push(otherKeys.length ? fingerprint(body, 'object', details, otherKeys) : null);
 
   let remaining = maxUnits;
   function parts(item, field) {
@@ -200,7 +250,7 @@ function snapshot(body, description, maxUnits) {
     for (let i = 0; i < count; i++) {
       if (!remaining) { result.truncated = true; break; }
       const part = typeof value === 'string' ? value : own(value, String(i));
-      group.items.push({ hash: digest(part), type: nativeType(part) });
+      group.items.push(fingerprint(part, nativeType(part), details));
       remaining--;
     }
     return group;
@@ -209,11 +259,91 @@ function snapshot(body, description, maxUnits) {
     if (!remaining) { result.truncated = true; break; }
     const item = own(description.entries, String(i));
     if (!isRecord(item)) throw INVALID;
-    const record = { hash: digest(item), type: nativeType(item) };
+    const record = fingerprint(item, nativeType(item), details);
+    if (details) {
+      const role = own(item, 'role');
+      record.role = ROLES.has(role) ? role : 'unknown';
+      record.category = category(record.type, record.role);
+    }
     remaining--;
     for (const field of PART_FIELDS) record[field] = parts(item, field);
     result.items.push(record);
   }
+  return result;
+}
+
+// Report objects are detached from retained snapshots. Sizes are structured JSON
+// node counts and UTF-16 VALUE string units, not serialized bytes or token counts.
+function summary(record) {
+  if (!record) return null;
+  const { hash, type, nodes, string_units, images, value_count, role, category } = record;
+  return { hash, type, nodes, string_units, images, value_count,
+    ...(role === undefined ? {} : { role, category,
+      content_parts: record.content?.count ?? 0, output_parts: record.output?.count ?? 0 }) };
+}
+
+function blocks(snapshot) {
+  if (!snapshot) return null;
+  const groups = Object.fromEntries(CATEGORIES.map(c => [c, {
+    hash: createHash('sha256'), fields: 0, items: 0, parts: 0,
+    nodes: 0, string_units: 0, images: 0,
+  }]));
+  function add(record, c, position, isItem) {
+    if (!record) return;
+    const group = groups[c];
+    group.hash.update(`${position}:${record.hash};`);
+    group[isItem ? 'items' : 'fields']++;
+    if (isItem) for (const field of PART_FIELDS) group.parts += record[field]?.count ?? 0;
+    for (const key of ['nodes', 'string_units', 'images']) group[key] += record[key];
+  }
+  snapshot.top.forEach((r, i) => add(r, topCategory(TOP_FIELDS[i]), `t${i}`, false));
+  snapshot.items.forEach((r, i) => add(r, r.category, `${snapshot.kind}${i}`, true));
+  return Object.fromEntries(Object.entries(groups).map(([c, group]) =>
+    [c, { ...group, hash: group.hash.digest('hex') }]));
+}
+
+function diff(before, after, maxEntries) {
+  const result = {
+    alignment: 'positional', complete: !(before?.truncated || after.truncated),
+    has_baseline: Boolean(before),
+    truncated: false, limit: maxEntries, total_changes: 0, reported_changes: 0,
+    totals: { top: 0, items: 0, parts: 0 },
+    before: blocks(before), after: blocks(after), changes: [],
+  };
+  function add(kind, area, index, parent_index, a, b, category) {
+    if (a?.hash === b?.hash) return;
+    result.totals[kind]++;
+    result.total_changes++;
+    if (result.changes.length < maxEntries) result.changes.push({
+      kind, area, index, parent_index, category,
+      before: summary(a), after: summary(b),
+    });
+  }
+  if (before) {
+    after.top.forEach((b, i) => add('top', TOP_FIELDS[i] ?? 'other', null, null,
+      before.top[i], b, topCategory(TOP_FIELDS[i])));
+    if (before.kind !== after.kind) {
+      result.complete = false; // Different native formats are not aligned.
+    } else for (let i = 0; i < Math.max(before.items.length, after.items.length); i++) {
+      // An unretained position is unknown, NOT absent. Only true boundaries
+      // establish insertions/removals when one snapshot exceeded its budget.
+      if ((i >= before.items.length && i < before.count) ||
+        (i >= after.items.length && i < after.count)) continue;
+      const a = before.items[i], b = after.items[i];
+      add('items', after.kind, i, null, a, b, b?.category ?? a.category);
+      for (const field of PART_FIELDS) {
+        const ap = a?.[field]?.items ?? [], bp = b?.[field]?.items ?? [];
+        for (let j = 0; j < Math.max(ap.length, bp.length); j++) {
+          if ((j >= ap.length && j < (a?.[field]?.count ?? 0)) ||
+            (j >= bp.length && j < (b?.[field]?.count ?? 0))) continue;
+          add('parts', field, j, i, ap[j], bp[j], b?.category ?? a.category);
+        }
+      }
+    }
+  }
+  result.reported_changes = result.changes.length;
+  result.truncated = !result.complete || result.total_changes > result.reported_changes;
+  result.totals_scope = !before ? 'no_baseline' : result.complete ? 'all' : 'retained_positions';
   return result;
 }
 
@@ -288,11 +418,14 @@ function compare(before, after, report) {
 
 export function createGptPrefixTracker({
   now = Date.now, maxSessions = 64, maxUnits = 4096, ttlMs = 3600000,
+  includeDiff = false, maxDiffEntries = 64,
 } = {}) {
   if (typeof now !== 'function' ||
     !Number.isSafeInteger(maxSessions) || maxSessions < 0 ||
     !Number.isSafeInteger(maxUnits) || maxUnits < 0 ||
-    !Number.isFinite(ttlMs) || ttlMs < 0)
+    !Number.isFinite(ttlMs) || ttlMs < 0 ||
+    typeof includeDiff !== 'boolean' ||
+    !Number.isSafeInteger(maxDiffEntries) || maxDiffEntries < 0 || maxDiffEntries > 256)
     throw new TypeError('Invalid prefix tracker options');
 
   const sessions = new Map();
@@ -301,6 +434,7 @@ export function createGptPrefixTracker({
       status: 'unknown', reason: null, has_key: false, common_items: null,
       previous_items: null, current_items: countItems(body),
       first_changed: null, truncated: false,
+      ...(includeDiff ? { diff: null } : {}),
     };
     let sessionKey, route;
     try {
@@ -346,7 +480,7 @@ export function createGptPrefixTracker({
     report.previous_items = previous?.count ?? null;
     let current;
     try {
-      current = snapshot(body, description, maxUnits);
+      current = snapshot(body, description, maxUnits, includeDiff);
     } catch (error) {
       // Do not compare a future request to a baseline preceding a failed snapshot.
       sessions.delete(identity);
@@ -363,6 +497,7 @@ export function createGptPrefixTracker({
     } else {
       report.status = 'first';
     }
+    if (includeDiff) report.diff = diff(previous, current, maxDiffEntries);
     sessions.delete(identity);
     sessions.set(identity, { scope, time, snapshot: current });
     while (sessions.size > maxSessions) sessions.delete(sessions.keys().next().value);
