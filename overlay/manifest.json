@@ -30,12 +30,12 @@
     {
       "path": "dist/core/openai-history.js",
       "upstreamSha256": "cb8bc0c34c817fe300fa74fd48f96e10c947536d1c933d83726cbf6925d682e5",
-      "overlaySha256": "564108b157262efbb349107dbcd8a19d772ce35bf639a022cfa92c6f2d8fc503"
+      "overlaySha256": "b268b482f0f0a678457f3971851c3a04fa04852400f80dde3ff1c1b42fc63d19"
     },
     {
       "path": "dist/core/openai.js",
       "upstreamSha256": "514ec43ab6d17a37434ec866711ff31b684ae12b5865200029194c8045b37c5f",
-      "overlaySha256": "cef2063ef46629b006e85b731069117514c4b5306c5822901a07b2b2d03e9d8f"
+      "overlaySha256": "aa109f9186a675f3e898ac101b2524216ece7761e8a817474dfad879f7390556"
     },
     {
       "path": "dist/core/tracker.js",

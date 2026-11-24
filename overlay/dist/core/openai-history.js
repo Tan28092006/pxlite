@@ -1781,7 +1781,11 @@ function chatMessageToTurn(msg, idx, ctx, opts) {
     const hasImage = Array.isArray(o.content) && o.content.some(isHistoryImagePart);
     const unknown = Array.isArray(o.content) && o.content.some((p) =>
         !p || (p.type !== 'text' && !isHistoryImagePart(p)) || (p.type === 'text' && typeof p.text !== 'string'));
-    const opaque = unknown || isRenderedGptContext(o) || (hasImage && !opts.collapseImages);
+    // Authority is not ordinary conversation history. A contiguous Chat
+    // collapse must stop before it, even for empty or image-bearing content,
+    // so the original role, ordering, parts and metadata stay on the wire.
+    const opaque = role === 'system' || role === 'developer' || unknown ||
+        isRenderedGptContext(o) || (hasImage && !opts.collapseImages);
     const body = chatContentToText(o.content);
     if (role === 'tool') {
         const id = typeof o.tool_call_id === 'string' ? o.tool_call_id : '';

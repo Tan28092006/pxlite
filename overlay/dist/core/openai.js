@@ -1230,7 +1230,16 @@ async function transformOpenAIChatCompletionsInner(body, opts = {}) {
     }
     const authorityDocs = [];
     const systemTexts = [];
-    for (const msg of req.messages) {
+    // A non-authority item before the first user is an ordering barrier.
+    const openingMessages = req.messages.slice(0, firstUserIdx);
+    const staticMessages = openingMessages.every((m) =>
+        (m.role === 'system' || m.role === 'developer') &&
+        (typeof m.content === 'string' || (Array.isArray(m.content) &&
+            m.content.every((p) => isTextPart(p) && Object.keys(p).every((k) => k === 'type' || k === 'text')))))
+        ? openingMessages
+        : [];
+    // Keep later authority at its original conversation position.
+    for (const msg of staticMessages) {
         if (msg.role !== 'system' && msg.role !== 'developer')
             continue;
         const text = contentText(msg.content);
@@ -1360,7 +1369,7 @@ async function transformOpenAIChatCompletionsInner(body, opts = {}) {
         slabUserMsg,
         ...req.messages.slice(firstUserIdx),
     ];
-    for (const msg of req.messages) {
+    for (const msg of staticMessages) {
         if (msg.role !== 'system' && msg.role !== 'developer')
             continue;
         if (!contentText(msg.content))
@@ -1442,7 +1451,17 @@ async function transformOpenAIResponsesInner(body, opts = {}) {
         systemTexts.push(req.instructions);
         info.staticChars += req.instructions.length;
     }
-    for (const item of inputItems) {
+    // Mid-conversation authority is not static: moving it into the opening
+    // slab changes when it takes effect and rewrites cached prefixes on append.
+    const openingItems = inputWasString ? [] : inputItems.slice(0, firstUserIdx);
+    const staticItems = openingItems.every((item) =>
+        (item.role === 'system' || item.role === 'developer') &&
+        (typeof item.content === 'string' || (Array.isArray(item.content) &&
+            item.content.every((part) => part && part.type === 'input_text' && typeof part.text === 'string' &&
+                Object.keys(part).every((k) => k === 'type' || k === 'text')))))
+        ? openingItems
+        : [];
+    for (const item of staticItems) {
         const r = item.role;
         if (r !== 'system' && r !== 'developer')
             continue;
@@ -1568,7 +1587,7 @@ async function transformOpenAIResponsesInner(body, opts = {}) {
         ? [{ type: 'input_text', text: slabFactSheet }]
         : [];
     const authorityPointerCount = (typeof req.instructions === 'string' && req.instructions.length > 0 ? 1 : 0)
-        + inputItems.filter((item) => {
+        + staticItems.filter((item) => {
             const it = item;
             return (it.role === 'system' || it.role === 'developer')
                 && responsesContentText(it.content).length > 0;
@@ -1613,7 +1632,7 @@ async function transformOpenAIResponsesInner(body, opts = {}) {
     // input_text part array keeps its array shape with a single pointer part, so a
     // request the caller sent as parts is not silently reshaped into a string.
     if (!inputWasString) {
-        for (const item of inputItems) {
+        for (const item of staticItems) {
             const it = item;
             if (it.role !== 'system' && it.role !== 'developer')
                 continue;
