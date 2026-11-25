@@ -96,6 +96,9 @@ async function startServe(t, extraEnv = {}, responseFixture) {
     PXLITE_ANTHROPIC_UPSTREAM: `http://127.0.0.1:${upstreamPort}`,
     PXLITE_TEST_UPSTREAM: `http://127.0.0.1:${upstreamPort}`,
     NODE_OPTIONS: [process.env.NODE_OPTIONS, `--import=${pathToFileURL(fetchFixture).href}`].filter(Boolean).join(' '),
+    // Never launch the user's real OpenCode CLI from a test: with HOME pointed at a temp
+    // directory it hangs until recall's 15 s timeout and keeps that directory locked.
+    PXLITE_OPENCODE_CLI: path.join(tmp, 'no-opencode-cli'),
     ...extraEnv,
   };
   delete env.PXPIPE_LOG;
@@ -107,10 +110,15 @@ async function startServe(t, extraEnv = {}, responseFixture) {
   child.stderr.on('data', (d) => (log += d));
 
   t.after(async () => {
+    // Wait for the proxy to exit before deleting its home: on Windows a live process still
+    // holds its log and pin files, and removing them 200 ms after kill() failed with EPERM.
+    const exited = child.exitCode !== null || child.signalCode !== null
+      ? Promise.resolve()
+      : new Promise((resolve) => child.once('exit', resolve));
     child.kill();
     upstream.close();
-    await sleep(200);
-    fs.rmSync(tmp, { recursive: true, force: true });
+    await Promise.race([exited, sleep(5000)]);
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
 
   const base = `http://127.0.0.1:${port}`;
@@ -433,7 +441,8 @@ test('GPT history epochs remain enabled when tool-result collapse is disabled', 
   await res.text();
   let evs = [];
   for (let i = 0; i < 50 && !evs.length; i++) { evs = readEvents(home); if (!evs.length) await sleep(100); }
-  assert.equal(evs[0]?.gpt_history_checkpoint_chunk, 130);
+  // 160 is the default since 13cbb9b ("increase checkpoint interval to 160"); this test still said 130.
+  assert.equal(evs[0]?.gpt_history_checkpoint_chunk, 160);
   assert.ok(!evs[0].tool_collapse);
 });
 
@@ -526,6 +535,51 @@ test('dedupe: PXLITE_DEDUPE_TAGS empty or 0 turns it off', { skip: SKIP }, async
   }
 });
 
+test('event rows: recall_applied/_images/_bytes only on the request that received a recall', { skip: SKIP }, async (t) => {
+  const { base, seen, home } = await startServe(t, { PXPIPE_MODELS: 'claude-test' });
+  const CUR = 'cccccccc-1111-2222-3333-444444444444';
+  const OLD = 'aaaaaaaa-1111-2222-3333-444444444444';
+  const OTHER = 'bbbbbbbb-1111-2222-3333-444444444444';
+  const proj = path.join(home, '.claude', 'projects', 'D--FIXTURE');
+  fs.mkdirSync(proj, { recursive: true });
+  const L = (o) => JSON.stringify({ cwd: 'D:\\FIXTURE', ...o }) + '\n';
+  fs.writeFileSync(path.join(proj, `${CUR}.jsonl`), L({ type: 'user', message: { role: 'user', content: 'hi' } }));
+  // The older session must be at least 6000 bytes to count as a recall candidate.
+  fs.writeFileSync(path.join(proj, `${OLD}.jsonl`), Array.from({ length: 60 }, (_, i) =>
+    L({ type: 'user', message: { role: 'user', content: `OLD question ${i} about the parser` } }) +
+    L({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: `OLD answer ${i} ${'detail '.repeat(12)}` }] } })).join(''));
+
+  const T0 = Date.now();
+  const trace = (m) => process.env.PXLITE_TEST_TRACE && console.error(`[trace +${Date.now() - T0}ms] ${m}`);
+  let recalled;
+  try {
+    recalled = await postClaude(base, seen, CUR, { model: 'claude-test', messages: [userText('recall aaaaaaaa')] });
+  } catch (err) {
+    trace(`postClaude failed: ${err.message}; upstream saw ${seen.map((e) => `${e.method} ${e.url} ${e.body.length}b`).join(', ')}`);
+    throw err;
+  }
+  trace(`recall request done, upstream body ${recalled.body.length} bytes`);
+  const hasImage = (b) => JSON.stringify(JSON.parse(b).messages).includes('"type":"image"');
+  assert.ok(hasImage(recalled.body), 'the upstream request carries the recall images');
+  await postClaude(base, seen, OTHER, { model: 'claude-test', messages: [userText('hello, no recall here')] });
+
+  let evs = [];
+  for (let i = 0; i < 60; i++) {
+    evs = readEvents(home).filter((e) => e.path === '/v1/messages');
+    if (evs.some((e) => e.session_id === CUR) && evs.some((e) => e.session_id === OTHER)) break;
+    await sleep(100);
+  }
+  const withRecall = evs.find((e) => e.session_id === CUR);
+  const without = evs.find((e) => e.session_id === OTHER);
+  assert.ok(withRecall && without, 'both requests have an event row');
+  assert.equal(withRecall.recall_applied, true);
+  assert.ok(withRecall.recall_images >= 1, `recall_images=${withRecall.recall_images}`);
+  assert.ok(withRecall.recall_bytes > 0, `recall_bytes=${withRecall.recall_bytes}`);
+  assert.equal(without.recall_applied, undefined);
+  assert.equal(without.recall_images, undefined);
+  assert.equal(without.recall_error, undefined);
+});
+
 test('session_id comes from the header even when the body is not JSON', { skip: SKIP }, async (t) => {
   const { base, home } = await startServe(t);
   const SID = 'dddddddd-1111-2222-3333-444444444444';
@@ -562,4 +616,33 @@ test('PXLITE_ANTHROPIC_UPSTREAM set but empty falls back to the default Anthropi
   // pxpipe may open a second connection for count_tokens; every one goes to the default host.
   assert.ok(targets.length > 0, 'nothing reached the default upstream');
   assert.deepEqual([...new Set(targets)], ['api.anthropic.com:443']);
+});
+
+test('served Claude conversation: transcript pointer starts on the first collapse and the log says so', { skip: SKIP }, async (t) => {
+  const WORDS = 'proxy cache prefix image chunk history tail agent tool result check step limit write read'.split(' ');
+  let seed = 7;
+  const prose = (n) => Array.from({ length: n }, () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return WORDS[seed % WORDS.length]; }).join(' ');
+  const code = (n) => Array.from({ length: n }, (_, i) => `  const v${i} = compute(${prose(3).replace(/ /g, ', ')}); // ${prose(5)}`).join('\n');
+  const all = [{ role: 'user', content: [{ type: 'text', text: 'start the task' }] }];
+  for (let r = 0; r < 200; r++) {
+    const id = `toolu_${String(r).padStart(4, '0')}`;
+    all.push({ role: 'assistant', content: [{ type: 'text', text: prose(40) }, { type: 'tool_use', id, name: 'Read', input: { file_path: `/repo/f${r}.js` } }] });
+    all.push({ role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content: `TOKEN_R${String(r).padStart(4, '0')}_X\n${code(60)}` }] });
+  }
+  const { base, home } = await startServe(t, { PXPIPE_MODELS: 'claude-opus-5-5' });
+  const send = async (n) => {
+    const messages = structuredClone(all.slice(0, n));
+    messages.at(-1).content.at(-1).cache_control = { type: 'ephemeral' };
+    const res = await fetch(`${base}/v1/messages`, { method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': 'k', 'anthropic-version': '2023-06-01', 'x-opencode-session-id': 'ses_e2etranscript' },
+      body: JSON.stringify({ model: 'claude-opus-5-5', max_tokens: 8, system: 'You are a coding agent. ' + prose(600), messages }) });
+    await res.text();
+  };
+  for (const n of [81, 121, 161, 201, 241, 281, 321, 361, 401]) await send(n);
+  await sleep(300);
+  const rows = readEvents(home).filter((e) => e.path === '/v1/messages');
+  console.log(rows.map((e) => `${e.collapsed_turns ?? 0}/${e.history_reason}/${e.history_transcript ?? '-'}`).join('  '));
+  assert.ok(rows.some((e) => e.collapsed_turns > 0), 'the conversation never collapsed, so this test proves nothing');
+  assert.ok(rows.some((e) => e.history_transcript), 'collapsed requests carried no history_transcript tag');
+  assert.ok(fs.existsSync(path.join(home, '.pxpipe', 'transcripts')), 'no transcripts directory was created');
 });

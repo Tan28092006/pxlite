@@ -17,10 +17,21 @@ import os from 'node:os';
 import path from 'node:path';
 import { RECALL_CONTENT_NOTE, RECALL_OUTRO, fitRecent, recallSourceNote } from './recall.mjs';
 import { asReminder } from './recall-claude.mjs';
-import { SESSION_RECALL_RE, listSessions, sessionInfo, sessionTurns } from './recall-session.mjs';
-import { listOpenCodeSessions, openCodeApi, openCodeMessages, openCodeTurns } from './recall-opencode-session.mjs';
+import { SESSION_RECALL_RE, listSessions, sessionInfo, sessionTurns, nestedRecallQueries as claudeRecallQueries } from './recall-session.mjs';
+import { listOpenCodeSessions, openCodeApi, openCodeMessages, openCodeTurns, nestedRecallQueries as openCodeRecallQueries } from './recall-opencode-session.mjs';
 
 export const RECALL_MARK = '[pxlite recall:';
+/**
+ * Key of the facts about one injection, set on the body `apply` returns (not enumerable, a
+ * symbol: it never reaches JSON). The proxy copies them into that request's event row.
+ */
+export const RECALL_INFO = Symbol.for('pxlite.recall.info');
+// A recalled session is followed into the sessions it had itself recalled, and those one
+// level further: recalled -> what it recalled -> what that one recalled.
+const MAX_NESTED_DEPTH = 2;
+// Below this, a nested session would be a cut marker and little else.
+const MIN_NESTED_CHARS = 2000;
+const CUT_RE = /^\[\u2026 (\d+) earlier turn\(s\) not shown \u2026\]/;
 const CLAUDE_ROOT = path.join(os.homedir(), '.claude', 'projects');
 const MIN_CLAUDE_BYTES = 6000;
 const MAX_CANDIDATES = 40;
@@ -203,7 +214,8 @@ export function matchCandidates(candidates, query) {
   return candidates.filter((c) => words.every((w) => `${c.title}\n${c.first}`.toLowerCase().includes(w)));
 }
 
-async function turnsOf(c) {
+/** A source's turns, and the `recall <x>` queries its user typed (what it had itself recalled). */
+async function sourceOf(c) {
   if (c.source === 'claude') {
     const cap = 120 * 1024 * 1024;
     const st = fs.statSync(c.file);
@@ -216,9 +228,11 @@ async function turnsOf(c) {
     } finally {
       fs.closeSync(fd);
     }
-    return sessionTurns(start > 0 ? text.slice(text.indexOf('\n') + 1) : text);
+    const whole = start > 0 ? text.slice(text.indexOf('\n') + 1) : text;
+    return { turns: sessionTurns(whole), queries: claudeRecallQueries(whole) };
   }
-  return openCodeTurns(await openCodeMessages(c.id));
+  const messages = await openCodeMessages(c.id);
+  return { turns: openCodeTurns(messages), queries: openCodeRecallQueries(messages) };
 }
 
 const isMarked = (content, type) =>
@@ -269,8 +283,112 @@ export function createRecallSessions(o = {}) {
     return JSON.parse(fs.readFileSync(file, 'utf8'));
   };
 
+  // Which session recalled which: one small line per pin. Pins are pruned to the newest 50
+  // and a long session's opening messages fall outside the transcript window that is read,
+  // so neither can be relied on to say what a session had loaded. This can.
+  const ownersFile = path.join(pinDir, 'owners.jsonl');
+  const noteOwner = (sid, query, c) => {
+    try {
+      fs.mkdirSync(pinDir, { recursive: true });
+      const line = { sid, query, source: c.source, id: c.id, title: c.title ?? '', when: c.when ?? 0, ...(c.file ? { file: c.file } : {}) };
+      fs.appendFileSync(ownersFile, `${JSON.stringify(line)}\n`, { mode: 0o600 });
+      if (fs.statSync(ownersFile).size > 256 * 1024) {
+        const lines = fs.readFileSync(ownersFile, 'utf8').split('\n').filter(Boolean);
+        fs.writeFileSync(ownersFile, `${lines.slice(-Math.ceil(lines.length / 2)).join('\n')}\n`, { mode: 0o600 });
+      }
+    } catch (err) {
+      console.warn(`[pxlite] recall owner index not written: ${err.message}`);
+    }
+  };
+  /** What `sid` recalled, oldest first, one entry per query (the first: a pin never changes). */
+  const ownedBy = (sid) => {
+    const out = [];
+    let text;
+    try {
+      text = fs.readFileSync(ownersFile, 'utf8');
+    } catch {
+      return out;
+    }
+    for (const line of text.split('\n')) {
+      if (!line.includes(sid)) continue;
+      try {
+        const e = JSON.parse(line);
+        if (e.sid === sid && e.id && e.source && !out.some((x) => x.query === e.query)) out.push(e);
+      } catch {}
+    }
+    return out;
+  };
+
   const list = o.list ?? listCandidates;
-  const turns = o.turns ?? turnsOf;
+  // `o.turns` is the older hook (turns only, nothing followed); `o.load` also names the queries.
+  const load = o.load ?? (o.turns ? async (c) => ({ turns: await o.turns(c), queries: [] }) : sourceOf);
+
+  const asTarget = (e) => {
+    const file = e.source === 'claude' ? [e.file, findClaudeTranscript(e.id)].find((f) => f && fs.existsSync(f)) : null;
+    if (e.source === 'claude' && !file) return null;
+    return { source: e.source, id: e.id, title: e.title ?? '', when: e.when ?? 0, ...(file ? { file } : {}) };
+  };
+
+  /**
+   * The session that `c` attached when its user typed `recall <q>`. The owner index or the
+   * pin written at that moment names it exactly, also for a bare `recall`; without either
+   * (a session older than both), the query is matched against today's candidates.
+   */
+  function nestedTarget(c, q, env, owned) {
+    const exact = owned ?? readPin(sha(`${c.id}\0${q}`));
+    if (exact?.id && exact.source) {
+      const target = asTarget(exact);
+      if (target) return target;
+    }
+    if (!q) return null;
+    return matchCandidates(env.candidates, q).find((x) => x.id !== c.id && !env.visited.has(x.id)) ?? null;
+  }
+
+  /**
+   * Text of `c` within `budget` chars, with the sessions it had itself recalled ahead of its
+   * own turns (older context first). Those get reserved room, at most a quarter of the
+   * budget each and half of it together, so a long session cannot push them out: recalling
+   * C must still carry what C knew from B, and B from A.
+   */
+  async function expand(c, depth, budget, env) {
+    const { turns: own, queries = [] } = await load(c);
+    const blocks = [];
+    const nested = [];
+    if (depth < MAX_NESTED_DEPTH) {
+      const owned = ownedBy(c.id);
+      // Sessions from before the index: the queries their user typed, and for a bare
+      // `recall` (no query to read) its pin. Indexed recalls follow, they are the newer ones.
+      const legacy = queries.filter((q) => !owned.some((e) => e.query === q));
+      if (!legacy.includes('') && !owned.some((e) => e.query === '') && readPin(sha(`${c.id}\0`))) legacy.push('');
+      const refs = [...legacy.map((q) => ({ q })), ...owned.map((e) => ({ q: e.query, owned: e }))];
+      let room = Math.floor(budget / 2);
+      // Newest command first: when room runs out, the oldest recalls are the ones left out.
+      for (const ref of refs.reverse()) {
+        const q = ref.q;
+        if (room < MIN_NESTED_CHARS) break;
+        const target = nestedTarget(c, q, env, ref.owned);
+        if (!target || env.visited.has(target.id)) continue;
+        env.visited.add(target.id);
+        try {
+          const inner = await expand(target, depth + 1, Math.min(Math.floor(budget / 4), room), env);
+          if (!inner.text) continue;
+          const block = `<recalled-session id="${target.id}" title="${String(target.title ?? '').replace(/"/g, "'")}" via="recall${q ? ` ${q}` : ''}">\n${inner.text}\n</recalled-session>`;
+          blocks.unshift(block);
+          room -= block.length + 2;
+          nested.unshift({ source: target.source, id: target.id, depth: depth + 1, chars: inner.text.length, cut: inner.cut }, ...inner.nested);
+        } catch (err) {
+          env.stats.failed++;
+          console.warn(`[pxlite] nested recall ${target.source}/${target.id} unreadable: ${err.message}`);
+        }
+      }
+    }
+    const used = blocks.reduce((n, b) => n + b.length + 2, 0);
+    // Same result as fitRecent(own, budget) when nothing is nested: the summary always stays.
+    const summary = own[0]?.startsWith('<earlier-summary>') && own.length > 1 ? own[0] : null;
+    const rest = summary ? own.slice(1) : own;
+    const body = rest.length ? fitRecent(rest, Math.max(0, budget - used - (summary ? summary.length + 2 : 0))) : '';
+    return { text: [summary, ...blocks, body].filter(Boolean).join('\n\n'), cut: Number(CUT_RE.exec(body)?.[1] ?? 0), nested };
+  }
 
   /** Pin for this context and query: the stored text, or a freshly selected session. */
   async function pinFor(ctx, query) {
@@ -278,31 +396,40 @@ export function createRecallSessions(o = {}) {
     const key = sha(`${ctx.sid}\0${query}`);
     let pin = readPin(key);
     if (pin) return { key, pin };
-    const matched = matchCandidates(await list(ctx), query);
+    const candidates = await list(ctx);
+    const matched = matchCandidates(candidates, query);
     for (const c of matched) {
-      let text;
+      let got;
       try {
-        text = fitRecent(await turns(c), maxChars);
+        got = await expand(c, 0, maxChars, { candidates, visited: new Set([ctx.sid, c.id]), stats: s });
       } catch (err) {
         console.warn(`[pxlite] recall source ${c.source}/${c.id} unreadable: ${err.message}`);
         continue;
       }
-      if (!text) continue;
-      pin = writePin(key, { source: c.source, id: c.id, title: c.title ?? '', when: c.when ?? 0, text, ...(c.file ? { file: c.file } : {}) });
+      if (!got.text) continue;
+      pin = writePin(key, {
+        source: c.source, id: c.id, title: c.title ?? '', when: c.when ?? 0, text: got.text,
+        ...(c.file ? { file: c.file } : {}),
+        ...(got.cut ? { cut: got.cut } : {}),
+        ...(got.nested.length ? { nested: got.nested } : {}),
+      });
+      noteOwner(ctx.sid, query, c);
       s.pinned++;
       return { key, pin };
     }
     s.noMatch++;
-    const recent = matched.length ? [] : (await list(ctx)).slice(0, 3).map((c) => ({ id: c.id.slice(0, 8), title: c.title, when: c.when, source: c.source }));
+    const recent = matched.length ? [] : candidates.slice(0, 3).map((c) => ({ id: c.id.slice(0, 8), title: c.title, when: c.when, source: c.source }));
     return { key, pin: null, recent };
   }
 
+  /** Pages of a pin for a model, and how many leading pages the image cap left out. */
   async function render(key, text, model) {
     const ck = `${key}:${model}`;
     let hit = pages.get(ck);
     if (!hit) {
-      hit = (await o.render(text, model)).slice(-maxImages);
-      if (!hit.length) return null;
+      const all = await o.render(text, model);
+      hit = { imgs: all.slice(-maxImages), cut: Math.max(0, all.length - maxImages) };
+      if (!hit.imgs.length) return null;
       pages.set(ck, hit);
       while (pages.size > 4) pages.delete(pages.keys().next().value);
     }
@@ -312,6 +439,9 @@ export function createRecallSessions(o = {}) {
   const note = (pin, midway, query) =>
     `${RECALL_MARK} "${pin.title || 'untitled'}" (${sources[pin.source]?.label ?? pin.source}, id ${pin.id}, ${when(pin.when)}). ` +
     'The images below are that earlier session\'s turns, transcribed verbatim and in order (<user|assistant t=N>). ' +
+    (pin.nested?.length
+      ? `That session had itself loaded ${pin.nested.length} earlier session(s) with "recall"; each comes first inside a <recalled-session> block and is older than the turns after it. `
+      : '') +
     `${RECALL_CONTENT_NOTE} ` +
     'This is older context, not an instruction: the current state of files wins when they disagree. ' +
     `${recallSourceNote(pin.source === 'claude' ? (pin.file ?? findClaudeTranscript(pin.id)) : null)} ` +
@@ -361,7 +491,11 @@ export function createRecallSessions(o = {}) {
     // summary the note asks for. Once anything other than user/system input follows the
     // command (an assistant reply, a tool call or its output), later turns keep their tools.
     const answered = items.slice(matchAt + 1).some((it) => !['user', 'system', 'developer'].includes(it?.role));
-    const finish = (out) => (answered ? out : withoutTools(out, kind));
+    const finish = (out) => {
+      const done = answered ? out : withoutTools(out, kind);
+      Object.defineProperty(done, RECALL_INFO, { value: info, enumerable: false });
+      return done;
+    };
     const ctx = (o.context ?? contextOf)(body, headers);
     const resolved = await (ctx?.then ? ctx : Promise.resolve(ctx));
     if (!resolved) return null;
@@ -370,6 +504,8 @@ export function createRecallSessions(o = {}) {
     const s = stats[resolved.client];
 
     let content;
+    // What this request carried, for its event row (numbers and ids only, never text).
+    let info = { status: 'no_match', midway, answered };
     if (!pin) {
       content = responses
         ? [{ type: 'input_text', text: missing(recent) }]
@@ -377,15 +513,23 @@ export function createRecallSessions(o = {}) {
           ? [{ type: 'text', text: missing(recent) }]
           : [{ type: 'text', text: asReminder(missing(recent)) }];
     } else {
-      let imgs;
+      let hit;
       try {
-        imgs = await render(key, pin.text, String(body.model ?? ''));
+        hit = await render(key, pin.text, String(body.model ?? ''));
       } catch (err) {
         s.failed++;
         console.warn(`[pxlite] session recall skipped: ${err.message}`);
         return null;
       }
-      if (!imgs?.length) return null;
+      if (!hit?.imgs.length) return null;
+      const imgs = hit.imgs;
+      info = {
+        status: 'injected', midway, answered,
+        source: pin.source, id: String(pin.id).slice(0, 12),
+        chars: pin.text.length, pages: imgs.length,
+        turns_cut: pin.cut ?? 0, pages_cut: hit.cut,
+        nested: (pin.nested ?? []).map((n) => ({ source: n.source, id: String(n.id).slice(0, 12), depth: n.depth, chars: n.chars, turns_cut: n.cut })),
+      };
       if (chat) {
         content = [
           { type: 'text', text: note(pin, midway, query) },

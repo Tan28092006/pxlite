@@ -15,6 +15,7 @@ import { factSheetText } from './factsheet.js';
 import { bytesToBase64 } from './png.js';
 // PXLITE PATCH: one-line tool calls shared with recall (pxlite/tool-lines.mjs, four levels up).
 import { SUBAGENT_TOOL_NAMES, errorLine, isLaunchAck, reportBlock, toolCallLines } from '../../../../tool-lines.mjs';
+import { ttlMsOf } from '../../../../collapse-tools.mjs';
 /**
  * Banner text blocks that bracket the collapsed-history image(s) in the synthetic
  * user message. Exported as the SINGLE SOURCE OF TRUTH: transform.ts keys its
@@ -39,7 +40,10 @@ export const HISTORY_DEFAULTS = {
     minCollapsePrefix: 10,
     cols: 100,
     collapseChunk: 50,
-    freezeChunk: 10,
+    // Measured on live Claude sessions: step 10 -> 2.3K chars/image, 20 -> 4.5K, 320 -> 14.8K,
+    // 640 -> 15.8K. The step only doubled when pages exceeded the image budget, so a session
+    // that lost its pinned step after a restart fell back to ~4K chars/image.
+    freezeChunk: 320,
     protectedPrefix: 0,
     reflow: true,
     style: DENSE_RENDER_STYLE,
@@ -331,8 +335,8 @@ function withoutTypedUserText(content) {
  * before the '[End of rendered context.]' boundary — same rule as
  * demoteProtectedHeadText, so pxpipe scaffolding is never mistaken for the task.
  */
-function typedUserText(content) {
-    return splitUserTyped(content).text;
+function typedUserText(content, standing) {
+    return splitUserTyped(content, standing).text;
 }
 /**
  * Same selection as {@link typedUserText}, but also reports WHICH block indices hold
@@ -340,7 +344,7 @@ function typedUserText(content) {
  * words never enter the history image while the tool_results in the same message —
  * which pair with an imaged assistant tool_use and must not be orphaned — still do.
  */
-function splitUserTyped(content) {
+function splitUserTyped(content, standing) {
     const typedIdx = new Set();
     if (typeof content === 'string')
         return { text: content.trim(), typedIdx };
@@ -362,6 +366,9 @@ function splitUserTyped(content) {
         if (!text)
             continue;
         if (text.startsWith('<system-reminder>'))
+            continue;
+        // PXLITE: a relocated system-prompt block is not something the user typed.
+        if (standing?.has(blk.text))
             continue;
         parts.push(text);
         typedIdx.add(i);
@@ -413,7 +420,17 @@ function splitStandingInstructions(text) {
     }
     return { reminders, rest };
 }
-function demoteProtectedHeadText(head) {
+// PXLITE: `standing` is the set of exact block texts that are the client's SYSTEM PROMPT,
+// relocated into the opening user message by the client (opencode-claude-auth moves every
+// non-identity system entry there to pass the OAuth system check; see relocatedSystemTexts
+// in transform.js). They carry no <system-reminder> wrapper, so the rule below read them as
+// the user's stale opening request and cut each to a 4000-char "must not be acted on"
+// preview at the first collapse: a 94k-char tool catalog lost 90k chars and the harness
+// rules lost their middle, mid-session, with nothing in the log. They are standing
+// instructions and pass through byte-identical, which also keeps the cached prefix across
+// them alive through the collapse. Matching is by exact text, so a block some earlier
+// stage rewrote simply falls back to the old demotion instead of being mislabelled.
+function demoteProtectedHeadText(head, standing, info) {
     return head.map((m, idx) => {
         if (m.role !== 'user')
             return m;
@@ -482,6 +499,12 @@ function demoteProtectedHeadText(head) {
                 continue;
             }
             if (blk && typeof blk === 'object' && blk.type === 'text') {
+                if (standing?.has(blk.text)) {
+                    out.push(blk);
+                    if (info)
+                        info.standingBlocksKept = (info.standingBlocksKept ?? 0) + 1;
+                    continue;
+                }
                 const blocks = demoteText(blk.text, blk.cache_control);
                 if (blocks) {
                     out.push(...blocks);
@@ -502,6 +525,50 @@ function demoteProtectedHeadText(head) {
 // prompt is a pasted document, not an instruction; that one gets its own image
 // rather than bloating the text, and still does not join the history transcript.
 const USER_TEXT_MAX_CHARS = 2000;
+const JUNK_RUN_MIN = 4;
+const NUMBERED_EMPTY = /^\s*(\d+)\s*[:|-]?\s*$/;
+// PXLITE: pasted tool output (e.g. an rg dump that printed tens of thousands of
+// "158247:" lines with nothing after the colon) costs one image row per line and
+// carries no information. Collapse runs of numbered-empty lines and runs of identical
+// lines into one marker line. Pure function of its input, so a frozen chunk stays
+// byte-identical; the untouched original lives in the history transcript file.
+export function collapseJunkLines(text) {
+    const lines = text.split('\n');
+    const out = [];
+    let i = 0;
+    while (i < lines.length) {
+        const first = lines[i];
+        const num = NUMBERED_EMPTY.exec(first);
+        if (num) {
+            let j = i;
+            while (j < lines.length && NUMBERED_EMPTY.test(lines[j]))
+                j++;
+            const run = j - i;
+            if (run >= JUNK_RUN_MIN) {
+                const lastNum = NUMBERED_EMPTY.exec(lines[j - 1])[1];
+                out.push(num[1] && lastNum !== num[1]
+                    ? `[... ${run} empty numbered lines omitted (${num[1]}..${lastNum}) ...]`
+                    : `[... ${run} empty lines omitted ...]`);
+                i = j;
+                continue;
+            }
+        }
+        else if (first.trim() !== '') {
+            let j = i + 1;
+            while (j < lines.length && lines[j] === first)
+                j++;
+            const run = j - i;
+            if (run >= JUNK_RUN_MIN) {
+                out.push(first, `[... previous line repeated ${run - 1} more times ...]`);
+                i = j;
+                continue;
+            }
+        }
+        out.push(first);
+        i++;
+    }
+    return out.join('\n');
+}
 /**
  * The user's own words for one chunk's message range, as native text — the
  * counterpart to withoutTypedUserText, which removed them from the render.
@@ -522,6 +589,7 @@ async function userTurnBlocks(messages, fromInclusive, upToExclusive, onImage) {
     // Within a chunk the order is fixed and the chunk is frozen once closed, so the
     // grouped bytes are as stable as the transcript image next to them.
     const imaged = [];
+    const firstSeen = new Map();
     const flush = () => {
         if (pending.length === 0)
             return;
@@ -544,7 +612,11 @@ async function userTurnBlocks(messages, fromInclusive, upToExclusive, onImage) {
         }
         // Past the cap this is a pasted document, not an instruction: it is rendered
         // verbatim below instead of bloating the text.
-        imaged.push({ idx: i, typed });
+        // PXLITE: harness notices (tool catalog changed, ...) repeat verbatim. Within one
+        // chunk only, so the chunk stays a pure function of its own message range.
+        imaged.push({ idx: i, typed, dupOf: firstSeen.get(typed) });
+        if (!firstSeen.has(typed))
+            firstSeen.set(typed, i);
     }
     flush();
     if (imaged.length > 0) {
@@ -561,7 +633,9 @@ async function userTurnBlocks(messages, fromInclusive, upToExclusive, onImage) {
             type: 'text',
             text: `[${imaged.length} user turn(s) from this session were too long to carry as text; they are rendered verbatim, in turn order, in the image(s) immediately below, separate from the history transcript. Each begins with its own <user t="N"> tag. PRIOR context, not the current request.\n${previews}]`,
         });
-        const imgs = await renderTextToPngsWithCharLimit(imaged.map((u) => `<user t="${u.idx}">\n${u.typed}\n</user>`).join('\n\n'), DENSE_CONTENT_COLS, DENSE_CONTENT_CHARS_PER_IMAGE, DENSE_RENDER_STYLE);
+        const imgs = await renderTextToPngsWithCharLimit(imaged.map((u) => u.dupOf !== undefined
+            ? `<user t="${u.idx}">\n[identical to <user t="${u.dupOf}"> above]\n</user>`
+            : `<user t="${u.idx}">\n${collapseJunkLines(u.typed)}\n</user>`).join('\n\n'), DENSE_CONTENT_COLS, DENSE_CONTENT_CHARS_PER_IMAGE, DENSE_RENDER_STYLE);
         for (const img of imgs) {
             out.push({
                 type: 'image',
@@ -576,7 +650,7 @@ async function userTurnBlocks(messages, fromInclusive, upToExclusive, onImage) {
     }
     return out;
 }
-function latestCollapsedUserPointer(messages, upToExclusive, protectedPrefix) {
+function latestCollapsedUserPointer(messages, upToExclusive, protectedPrefix, standing) {
     // Scan the WHOLE demoted/collapsed range, INCLUDING the protected head (#7):
     // in single-task sessions the opening turn is the only user-typed text there is.
     // Two fidelity regimes:
@@ -590,7 +664,10 @@ function latestCollapsedUserPointer(messages, upToExclusive, protectedPrefix) {
         const m = messages[i];
         if (m.role !== 'user')
             continue;
-        const typed = typedUserText(m.content);
+        // PXLITE: without `standing` the head turn's "typed" text began with the relocated
+        // system prompt, so the 4000-char verbatim carry was spent on harness boilerplate
+        // and the user's real opening request never made it into the pointer.
+        const typed = typedUserText(m.content, i < protectedPrefix ? standing : undefined);
         if (!typed)
             continue;
         if (i >= protectedPrefix) {
@@ -631,6 +708,85 @@ function rawMessageChars(messages, from, to) {
         }
     }
     return n;
+}
+// PXLITE: tokens the model still reads verbatim after a cut at `from`. A tool result that an
+// earlier stage already turned into an image has no text left to count, so it is charged a flat
+// amount instead of zero.
+const TAIL_IMAGE_TOKENS = 400;
+export function verbatimTailTokens(messages, from) {
+    let images = 0;
+    for (let i = Math.max(0, from); i < messages.length; i++) {
+        const c = messages[i]?.content;
+        if (!Array.isArray(c)) continue;
+        for (const b of c) {
+            if (b?.type === 'image') images++;
+            else if (b?.type === 'tool_result' && Array.isArray(b.content)) {
+                for (const y of b.content) if (y?.type === 'image') images++;
+            }
+        }
+    }
+    return Math.round(rawMessageChars(messages, Math.max(0, from), messages.length) / GATE_RAW_CPT) + images * TAIL_IMAGE_TOKENS;
+}
+// PXLITE: where each conversation was last cut. The cut point is recomputed from scratch on every
+// request; two of its inputs (is the agent mid tool chain, how heavy is the tail) can change
+// without the conversation getting shorter, and a cut that moves BACKWARDS re-keys every block
+// after it. Remembering the last cut makes it one-way. The host may attach a store
+// (configureLastCutStore) so the memory survives a restart, like the freeze-step pin in
+// session-state.js; without one it is lost on restart, which only costs the protection.
+const LAST_CUT_MAX = 2000;
+const LAST_CUT_FORMAT = 1;
+const LAST_CUT_MAX_IDLE_MS = 24 * 3_600_000;
+const LAST_CUT_SAVE_DEBOUNCE_MS = 250;
+const lastCutByKey = new Map();
+let lastCutStore;
+let lastCutTimer;
+function lastCutGet(key) {
+    return typeof key === 'string' && key.length > 0 ? lastCutByKey.get(key) : undefined;
+}
+function lastCutSet(key, value) {
+    if (typeof key !== 'string' || key.length === 0) return;
+    lastCutByKey.delete(key);
+    lastCutByKey.set(key, value);
+    if (lastCutByKey.size > LAST_CUT_MAX) lastCutByKey.delete(lastCutByKey.keys().next().value);
+    if (lastCutStore && !lastCutTimer) {
+        lastCutTimer = setTimeout(flushLastCuts, LAST_CUT_SAVE_DEBOUNCE_MS);
+        lastCutTimer.unref?.();
+    }
+}
+export function clearLastCuts() {
+    lastCutByKey.clear();
+}
+export function flushLastCuts() {
+    if (lastCutTimer) clearTimeout(lastCutTimer);
+    lastCutTimer = undefined;
+    if (!lastCutStore) return;
+    try {
+        const cuts = [...lastCutByKey].map(([key, v]) => ({ key, len: v.len, cut: v.cut, at: v.at }));
+        lastCutStore.save(JSON.stringify({ format: LAST_CUT_FORMAT, saved_at_ms: Date.now(), cuts }));
+    } catch { /* persistence is an optimisation and must never fail a request */ }
+}
+// Attach (or with undefined, detach) the store and restore what it holds. Entries already in
+// memory win; entries idle past 24h are dropped. Returns how many were restored. Never throws.
+export function configureLastCutStore(next, nowMs = Date.now()) {
+    flushLastCuts();
+    lastCutStore = next;
+    if (!next) return 0;
+    let restored = 0;
+    try {
+        const text = next.load();
+        const parsed = text ? JSON.parse(text) : undefined;
+        if (parsed?.format === LAST_CUT_FORMAT && Array.isArray(parsed.cuts)) {
+            for (const r of parsed.cuts) {
+                if (typeof r?.key !== 'string' || r.key.length === 0 || lastCutByKey.has(r.key)) continue;
+                if (!Number.isInteger(r.len) || !Number.isInteger(r.cut) || typeof r.at !== 'number') continue;
+                if (nowMs - r.at > LAST_CUT_MAX_IDLE_MS) continue;
+                lastCutByKey.set(r.key, { len: r.len, cut: r.cut, at: r.at });
+                restored++;
+            }
+            while (lastCutByKey.size > LAST_CUT_MAX) lastCutByKey.delete(lastCutByKey.keys().next().value);
+        }
+    } catch { /* unreadable store: behave as before, with no memory */ }
+    return restored;
 }
 export function estimateCollapseShrinkTokens(messages, from, to, renderedChars, priorWarmImageTokens = 0) {
     const raw = rawMessageChars(messages, from, to) / GATE_RAW_CPT;
@@ -682,6 +838,10 @@ export async function collapseHistory(messages, isProfitable, opts = {}) {
     }
     // Protected leading messages (slab) pass through untouched; collapse starts after them.
     const protectedPrefix = Math.max(0, Math.min(o.protectedPrefix ?? 0, messages.length));
+    // PXLITE: exact texts of client-relocated system-prompt blocks (see demoteProtectedHeadText).
+    const standing = Array.isArray(o.standingTexts) && o.standingTexts.length > 0
+        ? new Set(o.standingTexts)
+        : undefined;
     // Snap the cutoff to a collapseChunk grid so the rendered PNG stays byte-identical
     // across turns and keeps hitting Anthropic's prompt cache. See docs/HISTORY_CACHE_MODEL.md.
     // Floor at minCollapsePrefix + protectedPrefix so short histories still collapse.
@@ -693,17 +853,99 @@ export async function collapseHistory(messages, isProfitable, opts = {}) {
     const roundKeepTail = Number.isFinite(chainKeep) && chainKeep >= 0 ? chainKeep : 12;
     const relaxedCut = inChain && process.env.PXLITE_TOOL_ROUND_CUT !== '0';
     const rawCutoff = messages.length - (relaxedCut ? Math.max(o.keepTail, roundKeepTail) : o.keepTail);
-    const cutoff = o.collapseChunk > 0
-        ? Math.min(rawCutoff, Math.max(o.minCollapsePrefix + protectedPrefix, Math.floor(rawCutoff / o.collapseChunk) * o.collapseChunk))
+    const firstCut = o.minCollapsePrefix + protectedPrefix;
+    let cutoff = o.collapseChunk > 0
+        ? Math.min(rawCutoff, Math.max(firstCut, Math.floor(rawCutoff / o.collapseChunk) * o.collapseChunk))
         : rawCutoff;
-    const boundary = findClosedPrefixBoundary(messages, cutoff, relaxedCut);
-    if (boundary < 0) {
+    const lastCut = lastCutGet(o.stickyKey);
+    // PXLITE: token floor on the verbatim tail. The cut is counted in messages, so a checkpoint
+    // that lands on a run of short messages can leave only a few thousand tokens of the
+    // conversation in text. Hold the cut back by one chunk
+    // until the tail behind the new cut is heavy enough. Skipped once this conversation has
+    // already been cut here, so a tail that later shrinks cannot pull the cut back.
+    {
+        const envFloor = Number.parseInt(process.env.PXLITE_KEEP_TAIL_TOKENS ?? '6000', 10);
+        const floorTok = opts.keepTailTokens !== undefined ? opts.keepTailTokens : (Number.isFinite(envFloor) ? envFloor : 6000);
+        if (floorTok > 0 && !forceCollapse && o.collapseChunk > 0 && cutoff > 0 && !(lastCut && lastCut.cut >= cutoff)) {
+            const tailTok = verbatimTailTokens(messages, cutoff);
+            if (tailTok < floorTok) {
+                info.tailTokens = tailTok;
+                if (cutoff <= firstCut) {
+                    info.reason = 'tail_floor';
+                    return { messages, info };
+                }
+                cutoff = Math.max(firstCut, cutoff - o.collapseChunk);
+                info.tailHeld = true;
+            }
+        }
+    }
+    let boundary = findClosedPrefixBoundary(messages, cutoff, relaxedCut);
+    // PXLITE: the first cut sits at exactly minCollapsePrefix + protectedPrefix and does not move
+    // again until the next chunk. When that index is an assistant tool call (a conversation whose
+    // user turns sit on odd indices: OpenCode with the system prompt relocated into a leading user
+    // message), the closed boundary is one message short, forever: the main session of 2026-11-24
+    // was refused 49 times in a row and reached 196k tokens before its first collapse. Walk the
+    // cut forward to the next closed boundary instead. Same messages give the same answer on
+    // every later request.
+    if (boundary + 1 - protectedPrefix < o.minCollapsePrefix && process.env.PXLITE_FIRST_CUT_EXTEND !== '0') {
+        const maxCut = Math.min(rawCutoff, cutoff + 6);
+        for (let c = cutoff + 1; c <= maxCut; c++) {
+            const b = findClosedPrefixBoundary(messages, c, relaxedCut);
+            if (b + 1 - protectedPrefix >= o.minCollapsePrefix) {
+                boundary = b;
+                info.firstCutExtended = c - cutoff;
+                break;
+            }
+        }
+    }
+    let collapseLen = boundary + 1;
+    const proposedLen = collapseLen;
+    // PXLITE: never cut earlier than last time. Outside a tool chain the boundary search is
+    // stricter and can land before the cut the previous request used (2026-11-24: 198 -> 182,
+    // 98 -> 96 and 348 -> 338 collapsed turns, each followed by a move forward again). The earlier
+    // cut was a closed boundary then and still is. stickyRefused says why the cut was not reused.
+    if (lastCut && lastCut.len > collapseLen && process.env.PXLITE_STICKY_CUT !== '0') {
+        if (lastCut.len > messages.length - o.keepTail)
+            info.stickyRefused = 'tail';
+        else if (findClosedPrefixBoundary(messages, lastCut.len, true) + 1 !== lastCut.len)
+            info.stickyRefused = 'open';
+        else {
+            collapseLen = lastCut.len;
+            info.stickyCut = true;
+        }
+    }
+    // PXLITE: a small step forward is not worth a rewrite. Any move of the cut re-renders the newest
+    // history image and everything after it (45-52k tokens written on 2026-11-24 for a 6-turn move,
+    // 7 s after a 44-turn move to the same grid cell: strict boundary search first, relaxed one next).
+    // While the cache is warm, keep the previous cut unless the move is at least minMove turns.
+    // Once the cache has expired the prefix is rewritten anyway, so the cut moves freely.
+    if (lastCut && !forceCollapse && process.env.PXLITE_STICKY_CUT !== '0' && collapseLen > lastCut.len) {
+        const envMove = Number.parseInt(process.env.PXLITE_MIN_CUT_MOVE ?? '', 10);
+        const minMove = Number.isFinite(envMove) && envMove >= 0 ? envMove : Math.floor(o.collapseChunk / 2);
+        const warm = typeof lastCut.at === 'number' && (o.now ?? Date.now)() - lastCut.at < ttlMsOf(process.env.PXLITE_CACHE_TTL ?? '1h');
+        if (warm && collapseLen - lastCut.len < minMove
+            && lastCut.len <= messages.length - o.keepTail
+            && findClosedPrefixBoundary(messages, lastCut.len, true) + 1 === lastCut.len) {
+            collapseLen = lastCut.len;
+            info.stickyCut = true;
+        }
+    }
+    if (lastCut && (collapseLen !== lastCut.len || proposedLen !== collapseLen)) {
+        info.cutMove = {
+            from: lastCut.len,
+            to: collapseLen,
+            target: cutoff,
+            mode: relaxedCut ? 'relaxed' : 'strict',
+            ...(proposedLen !== collapseLen ? { held: proposedLen - collapseLen } : {}),
+            ...(typeof lastCut.at === 'number' ? { gap_s: Math.round(((o.now ?? Date.now)() - lastCut.at) / 1000) } : {}),
+        };
+    }
+    if (collapseLen <= 0) {
         info.reason = 'no_closed_prefix';
         return { messages, info };
     }
     // Need at least minCollapsePrefix turns in [protectedPrefix..boundary] — collapsing
     // 2-3 turns is net cost (cache-amortization math doesn't work at small scale).
-    let collapseLen = boundary + 1;
     if (collapseLen - protectedPrefix < o.minCollapsePrefix) {
         info.reason = 'prefix_too_short';
         return { messages, info };
@@ -725,7 +967,7 @@ export async function collapseHistory(messages, isProfitable, opts = {}) {
         msgLen.push(seg.length === 0 ? 0 : seg.length + 2); // +2 = the "\n\n" joiner
         const m = messages[i];
         const typed = m.role === 'user' ? typedUserText(m.content) : '';
-        userImgLen.push(typed && typed.length > USER_TEXT_MAX_CHARS ? typed.length + 20 : 0);
+        userImgLen.push(typed && typed.length > USER_TEXT_MAX_CHARS ? collapseJunkLines(typed).length + 20 : 0);
     }
     const sumOf = (arr, from, to) => {
         let n = 0;
@@ -942,7 +1184,7 @@ export async function collapseHistory(messages, isProfitable, opts = {}) {
         info.reason = 'render_empty';
         return { messages, info };
     }
-    const latestUserPointer = latestCollapsedUserPointer(messages, collapseLen, protectedPrefix);
+    const latestUserPointer = latestCollapsedUserPointer(messages, collapseLen, protectedPrefix, standing);
     const historyFactSheet = factSheetText(text);
     const syntheticContent = [
         { type: 'text', text: HISTORY_SYNTHETIC_INTRO },
@@ -957,11 +1199,15 @@ export async function collapseHistory(messages, isProfitable, opts = {}) {
     };
     // Demote stale request text in the protected head so the session's opening turn
     // can't surface as clean native text ahead of the history image and read as live.
-    const head = demoteProtectedHeadText(messages.slice(0, protectedPrefix));
+    const head = demoteProtectedHeadText(messages.slice(0, protectedPrefix), standing, info);
     const tail = messages.slice(collapseLen);
     info.collapsedTurns = collapseLen - protectedPrefix;
+    // PXLITE PATCH: the collapsed message range, for the on-disk text copy (history-transcript.mjs).
+    info.collapseFrom = protectedPrefix;
+    info.collapseTo = collapseLen;
     info.collapsedChars = text.length;
     info.collapsedImages = imageCount;
+    lastCutSet(o.stickyKey, { len: collapseLen, cut: Math.max(cutoff, lastCut?.cut ?? 0), at: (o.now ?? Date.now)() });
     if (carryOverOrdinal >= 0)
         info.carryOverImageOrdinal = carryOverOrdinal;
     // [slab, history image, live tail] — slab cache_control anchor stays at the front.

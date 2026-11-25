@@ -414,6 +414,76 @@ function extractSystemText(sys) {
     }
     return { text: textParts.join('\n\n'), kept };
 }
+/** Carries the relocated system-prompt texts on `info` without leaking 100k chars into
+ *  anything that serializes it (symbol keys are skipped by JSON.stringify/Object.keys). */
+const STANDING_TEXTS = Symbol('pxlite.standingTexts');
+/**
+ * PXLITE: the texts of the client's SYSTEM PROMPT when the client moved it into the
+ * opening user message.
+ *
+ * opencode-claude-auth (transforms.js, relocateSystemEntries) keeps only the billing
+ * header and the OAuth identity in `system` and unshifts every other system entry onto
+ * the first user message as plain text blocks, because the OAuth endpoint rejects
+ * third-party text in `system`. On the wire they are indistinguishable from typed user
+ * text except by shape, and the plugin's shape is exact:
+ *   - array content:  every moved block but the last ends in "\n\n", then the user's parts
+ *   - string content: every moved block ends in "\n\n", then ONE block with the user's text
+ * so the leading run of "\n\n"-terminated text blocks is certainly relocated, and the block
+ * after it is the last relocated one unless it is the only block left (string case).
+ * A lone moved block has no suffix at all; it is accepted only when it carries a cache
+ * breakpoint, which the plugin (or the client's own system-block caching) puts there.
+ *
+ * Returns [] unless `system` holds a billing header and nothing else but the identity
+ * line: a request that still has its own system prompt was not relocated (Claude Code
+ * itself sends billing + identity + its prompt), and its opening text is the user's.
+ * A miss here is safe (the old demotion applies); a false hit keeps an opening request
+ * verbatim, so the rules above stay strict rather than generous.
+ */
+export function relocatedSystemTexts(req) {
+    const first = req?.messages?.[0];
+    if (!first || first.role !== 'user' || !Array.isArray(first.content))
+        return [];
+    const sys = typeof req.system === 'string'
+        ? [{ type: 'text', text: req.system }]
+        : Array.isArray(req.system) ? req.system : undefined;
+    if (!sys)
+        return [];
+    // The billing header is the plugin's fingerprint (it always injects one as system[0]).
+    // The identity line is there only when the client's own prompt began with it: measured
+    // on opencode-claude-auth 3.0.0, a plain OpenCode prompt leaves `system` = [billing].
+    let billing = false;
+    for (const b of sys) {
+        if (!b || typeof b !== 'object' || b.type !== 'text' || typeof b.text !== 'string')
+            return [];
+        const t = b.text.trim();
+        if (t === '')
+            continue;
+        if (t.startsWith('x-anthropic-billing-header')) {
+            billing = true;
+            continue;
+        }
+        if (!OAUTH_IDENTITIES.includes(t))
+            return [];
+    }
+    if (!billing)
+        return [];
+    const c = first.content;
+    const isText = (b) => b && typeof b === 'object' && b.type === 'text' && typeof b.text === 'string';
+    let run = 0;
+    while (run < c.length && isText(c[run]) && c[run].text.endsWith('\n\n'))
+        run++;
+    const after = c.length - run;
+    let n;
+    if (run === 0)
+        n = after >= 2 && isText(c[0]) && c[0].cache_control !== undefined ? 1 : 0;
+    else if (after === 0)
+        // Every block ends in "\n\n", so the user's own text does too (string case):
+        // the last block is theirs. Never claim the whole message as system prompt.
+        n = run - 1;
+    else
+        n = after >= 2 && isText(c[run]) ? run + 1 : run;
+    return c.slice(0, n).map((b) => b.text).filter((t) => t.trim() !== '');
+}
 /**
  * Remove a standalone OAuth identity block from passed-through system blocks.
  * The caller re-emits it first; see the identity note above OAUTH_IDENTITIES.
@@ -1473,6 +1543,34 @@ export function imageByteHeadroom(info, limit) {
  * overshoot, oldest pages first (collapseHistory keeps the oldest, so the frozen chunk
  * bytes stay stable). If nothing fits after three tries the caller's skip path still runs.
  */
+/** PXLITE PATCH (history-transcript.mjs): the host keeps a text copy of the collapsed turns
+ *  on disk and may hand back one pointer line, placed just before the closing banner of the
+ *  history message. The host is called on every request, collapsed or not, because it only
+ *  starts the pointer on a request that rewrites the bytes after the last image anyway. */
+function applyHistoryTranscript(o, source, histInfo, info, out) {
+    if (typeof o.historyTranscript !== 'function')
+        return;
+    try {
+        const applied = histInfo.collapsedTurns > 0 &&
+            !(histInfo.collapsedImageBytes > imageByteHeadroom(info, o.maxImageBytes));
+        const note = o.historyTranscript({
+            messages: source,
+            from: applied ? histInfo.collapseFrom : 0,
+            to: applied ? histInfo.collapseTo : 0,
+            conversation: info.firstUserSha8,
+        });
+        if (!applied || typeof note !== 'string' || note === '')
+            return;
+        const synthetic = out.find((m) => Array.isArray(m.content) &&
+            m.content[0]?.type === 'text' &&
+            m.content[0].text === HISTORY_SYNTHETIC_INTRO);
+        if (synthetic)
+            synthetic.content.splice(synthetic.content.length - 1, 0, { type: 'text', text: note });
+    }
+    catch {
+        // A transcript problem must never change or fail a request.
+    }
+}
 async function collapseHistoryFitBytes(messages, profitable, collapseOpts, info, o) {
     let r = await collapseHistory(messages, profitable, collapseOpts);
     let budget = collapseOpts.imageBudget;
@@ -1522,6 +1620,31 @@ export function countNativeImageBytes(messages) {
     }
     return bytes;
 }
+// PXLITE PATCH: the largest base64 payload in the request (image, document/PDF, anything with
+// source.data), nested tool results included. The 2026-11-24 write of 75k tokens came with 8.7 MB
+// more in the marked prefix while every text and image counter stayed flat; nothing named it.
+const BIG_BLOCK_MIN_BYTES = 256 * 1024;
+export function largestBinaryBlock(messages) {
+    let best;
+    const see = (blk, where) => {
+        const data = blk?.source?.data;
+        if (typeof data === 'string' && data.length >= BIG_BLOCK_MIN_BYTES && (!best || data.length > best.bytes))
+            best = { type: String(blk.type), bytes: data.length, where };
+    };
+    let i = 0;
+    for (const m of messages ?? []) {
+        if (Array.isArray(m?.content)) {
+            for (const blk of m.content) {
+                see(blk, i);
+                if (blk?.type === 'tool_result' && Array.isArray(blk.content))
+                    for (const inner of blk.content)
+                        see(inner, i);
+            }
+        }
+        i++;
+    }
+    return best;
+}
 /** Count image blocks already present in the caller's messages. Runs BEFORE any
  *  rewrite, so it sees the client's images only — ours do not exist yet. */
 export function countNativeImages(messages) {
@@ -1561,7 +1684,7 @@ export function countNativeImages(messages) {
 function historyGridTuning(info) {
     const headroom = imageHeadroom(info);
     const imageBudget = Math.max(1, Math.min(ANTHROPIC_HISTORY_IMAGE_BUDGET, headroom));
-    const session = noteHistoryRequest(info.firstUserSha8);
+    const session = noteHistoryRequest(info.historyKey ?? info.firstUserSha8);
     // Diagnostics only (events.jsonl history_tuning): why this request's grid was cut the way it was.
     // `cold` is the same flag that turns packFill on.
     info.historyTuning = { cold: session.cold === true, imageBudget, minFreezeStep: session.minFreezeStep };
@@ -1834,11 +1957,16 @@ async function runHistoryCollapseAndFinalize(req, info, o, opts, droppedCodepoin
         // Rules the model cannot read verbatim are rules it does not follow, so the
         // message carrying them is protected from collapse the same way the
         // non-collapse path already keeps <system-reminder> as text below.
-        const protectedPrefix = firstMessageHasSystemReminder(req.messages) ? 1 : 0;
+        // PXLITE: the same holds for a system prompt the client relocated into that
+        // message (no <system-reminder> wrapper, see relocatedSystemTexts): unprotected,
+        // it was rendered into the history image as an over-long "user turn".
+        const standingTexts = info[STANDING_TEXTS] ?? [];
+        const protectedPrefix = firstMessageHasSystemReminder(req.messages) || standingTexts.length > 0 ? 1 : 0;
         const tuning = historyGridTuning(info);
         const { messages: newMessages, info: histInfo } = await collapseHistoryFitBytes(req.messages, historyProfitable, {
             cols: historyGeometry.cols,
             protectedPrefix,
+            standingTexts,
             reflow: o.reflow,
             style: historyGeometry.style,
             maxHeightPx: historyGeometry.maxHeightPx,
@@ -1847,14 +1975,29 @@ async function runHistoryCollapseAndFinalize(req, info, o, opts, droppedCodepoin
             packFill: tuning.packFill,
             minFreezeStep: tuning.minFreezeStep,
             priorWarmImageTokens: o.priorWarmImageTokens,
+            stickyKey: info.historyKey ?? info.firstUserSha8,
         }, info, o);
-        recordFreezeStep(info.firstUserSha8, histInfo.freezeStep);
+        recordFreezeStep(info.historyKey ?? info.firstUserSha8, histInfo.freezeStep);
+        if ((histInfo.standingBlocksKept ?? 0) > 0)
+            info.standingBlocksKept = histInfo.standingBlocksKept;
         if (histInfo.freezeStep !== undefined)
             info.historyFreezeStep = histInfo.freezeStep;
         if (histInfo.budgetTrimmed)
             info.historyBudgetTrimmed = true;
+        // Diagnostics only (events.jsonl history_cut): why the cut point is not the plain grid value.
+        if (histInfo.tailHeld || histInfo.stickyCut || histInfo.stickyRefused || histInfo.firstCutExtended || histInfo.tailTokens !== undefined || histInfo.cutMove) {
+            info.historyCut = {
+                tailHeld: histInfo.tailHeld === true,
+                stickyCut: histInfo.stickyCut === true,
+                stickyRefused: histInfo.stickyRefused,
+                firstCutExtended: histInfo.firstCutExtended ?? 0,
+                tailTokens: histInfo.tailTokens,
+                cutMove: histInfo.cutMove,
+            };
+        }
         if (tuning.packFill)
             info.historyPackFill = true;
+        applyHistoryTranscript(o, req.messages, histInfo, info, newMessages);
         // Atomic admission by weight. The collapse is one semantic group: applying
         // it means every collapsed message becomes pages, so a group that does not
         // fit the byte budget is not applied at all and the original text stands.
@@ -1872,6 +2015,7 @@ async function runHistoryCollapseAndFinalize(req, info, o, opts, droppedCodepoin
             info.collapsedTurns = histInfo.collapsedTurns;
             info.collapsedChars = histInfo.collapsedChars;
             info.collapsedImages = histInfo.collapsedImages;
+            info.collapsedImagePixels = histInfo.collapsedImagePixels;
             info.imageCount += histInfo.collapsedImages;
             info.imageBytes += histInfo.collapsedImageBytes;
             info.imagePixels = (info.imagePixels ?? 0) + histInfo.collapsedImagePixels;
@@ -2197,6 +2341,7 @@ async function transformRequestInner(body, opts = {}) {
     // later path (slab, tool_results, history) rewrites content in place.
     info.nativeImages = countNativeImages(req.messages);
     info.nativeImageBytes = countNativeImageBytes(req.messages);
+    info.bigBlock = largestBinaryBlock(req.messages);
     // 0. User-pinned instructions. Fold the transcript's pin commands, then remove
     //    them from the outbound copy — the client's own transcript is untouched, so
     //    the next request still carries every command and re-derives the same state.
@@ -2232,6 +2377,15 @@ async function transformRequestInner(body, opts = {}) {
             pinsRewrote = false;
             info.pinError = String(e?.message ?? e);
         }
+    }
+    // 0b. PXLITE: a system prompt the client relocated into the opening user message.
+    //     Read here, after the pin strip (so the texts match what every later stage
+    //     sees) and before anything is prepended to that message.
+    const standingTexts = relocatedSystemTexts(req);
+    if (standingTexts.length > 0) {
+        info[STANDING_TEXTS] = standingTexts;
+        info.relocatedSystemBlocks = standingTexts.length;
+        info.relocatedSystemChars = standingTexts.reduce((n, t) => n + t.length, 0);
     }
     // 1. Pull system text out. Split into:
     //    - billingLine: Claude Code's per-turn random header (must NOT be cached).
@@ -2296,6 +2450,9 @@ async function transformRequestInner(body, opts = {}) {
     const firstUserSha = firstUser ? await sha8(firstUser) : undefined;
     if (firstUserSha)
         info.firstUserSha8 = firstUserSha;
+    // PXLITE PATCH: the main thread and its subagents can open with the same first user message, so
+    // the hash alone made them share one cut/freeze state. The host passes a per-thread key.
+    info.historyKey = o.conversationKey ? `${o.conversationKey}\u0000${firstUserSha ?? ''}` : firstUserSha;
     // Canary: slab tags whose content churns within a session bust the image
     // cache every turn — report them regardless of the hardcoded lists.
     if (staticTagContents.size > 0) {
@@ -2616,6 +2773,7 @@ async function transformRequestInner(body, opts = {}) {
         const { messages: newMessages, info: histInfo } = await collapseHistoryFitBytes(req.messages, historyProfitable, {
             cols: historyGeometry.cols,
             protectedPrefix: slabAnchorIdx >= 0 ? slabAnchorIdx + 1 : 0,
+            standingTexts: info[STANDING_TEXTS] ?? [],
             reflow: o.reflow,
             style: historyGeometry.style,
             maxHeightPx: historyGeometry.maxHeightPx,
@@ -2624,14 +2782,29 @@ async function transformRequestInner(body, opts = {}) {
             packFill: tuning.packFill,
             minFreezeStep: tuning.minFreezeStep,
             priorWarmImageTokens: o.priorWarmImageTokens,
+            stickyKey: info.historyKey ?? info.firstUserSha8,
         }, info, o);
-        recordFreezeStep(info.firstUserSha8, histInfo.freezeStep);
+        recordFreezeStep(info.historyKey ?? info.firstUserSha8, histInfo.freezeStep);
+        if ((histInfo.standingBlocksKept ?? 0) > 0)
+            info.standingBlocksKept = histInfo.standingBlocksKept;
         if (histInfo.freezeStep !== undefined)
             info.historyFreezeStep = histInfo.freezeStep;
         if (histInfo.budgetTrimmed)
             info.historyBudgetTrimmed = true;
+        // Diagnostics only (events.jsonl history_cut): why the cut point is not the plain grid value.
+        if (histInfo.tailHeld || histInfo.stickyCut || histInfo.stickyRefused || histInfo.firstCutExtended || histInfo.tailTokens !== undefined || histInfo.cutMove) {
+            info.historyCut = {
+                tailHeld: histInfo.tailHeld === true,
+                stickyCut: histInfo.stickyCut === true,
+                stickyRefused: histInfo.stickyRefused,
+                firstCutExtended: histInfo.firstCutExtended ?? 0,
+                tailTokens: histInfo.tailTokens,
+                cutMove: histInfo.cutMove,
+            };
+        }
         if (tuning.packFill)
             info.historyPackFill = true;
+        applyHistoryTranscript(o, req.messages, histInfo, info, newMessages);
         // Atomic admission by weight. The collapse is one semantic group: applying
         // it means every collapsed message becomes pages, so a group that does not
         // fit the byte budget is not applied at all and the original text stands.
@@ -2649,6 +2822,7 @@ async function transformRequestInner(body, opts = {}) {
             info.collapsedTurns = histInfo.collapsedTurns;
             info.collapsedChars = histInfo.collapsedChars;
             info.collapsedImages = histInfo.collapsedImages;
+            info.collapsedImagePixels = histInfo.collapsedImagePixels;
             info.imageCount += histInfo.collapsedImages;
             info.imageBytes += histInfo.collapsedImageBytes;
             info.imagePixels = (info.imagePixels ?? 0) + histInfo.collapsedImagePixels;

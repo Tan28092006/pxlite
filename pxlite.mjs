@@ -22,9 +22,11 @@ import { createBlockDedupe, parseDedupeTags } from './dedupe-blocks.mjs';
 import { createToolCollapse, ttlMsOf } from './collapse-tools.mjs';
 import { listSessions, sessionInfo } from './recall-session.mjs';
 import { listOpenCodeSessions } from './recall-opencode-session.mjs';
-import { createRecallSessions } from './recall-sessions.mjs';
+import { RECALL_INFO, createRecallSessions } from './recall-sessions.mjs';
 import { createGptCachePolicy, toGptCacheSeedEvent } from './gpt-cache-policy.mjs';
 import { createGptPrefixTracker } from './gpt-prefix.mjs';
+import { createPrefixTrace } from './prefix-trace.mjs';
+import { createHistoryTranscript } from './history-transcript.mjs';
 import { describeGptUpstream, describeGptResponse } from './gpt-upstream-diagnostics.mjs';
 import { projectGptEvent } from './gpt-event-log.mjs';
 
@@ -50,6 +52,11 @@ const HOME = os.homedir();
 const STATE_DIR = path.join(HOME, '.pxpipe');
 const PORT = Number(process.env.PORT ?? 47821);
 const PID_FILE = path.join(STATE_DIR, `pxlite-${PORT}.pid`);
+// Why a closed GPT history prefix was rebuilt (prefix-trace.mjs): hashes and lengths only.
+const prefixTrace = createPrefixTrace({ file: process.env.PXLITE_PREFIX_TRACE ?? path.join(STATE_DIR, 'prefix-trace.jsonl') });
+// Searchable text copy of collapsed Claude turns (history-transcript.mjs). Off with PXLITE_HISTORY_TRANSCRIPT=0.
+const historyTranscript = /^(0|false|off|no)$/i.test(process.env.PXLITE_HISTORY_TRANSCRIPT ?? '') ? null
+  : createHistoryTranscript({ dir: process.env.PXLITE_TRANSCRIPT_DIR ?? path.join(STATE_DIR, 'transcripts') });
 const HOST = '127.0.0.1';
 const CONNECT_PORT = Number(process.env.PXLITE_CONNECT_PORT ?? PORT + 1);
 // Vendored pxpipe 0.16.0 whose glyph atlases add Vietnamese (build/atlas, vi-eval/RESULTS.md).
@@ -286,19 +293,30 @@ async function toWebRequest(req) {
     }
     if (r) {
       try {
-        const next = await r.apply(JSON.parse(bytes.toString('utf8')), headers);
+        const before = JSON.parse(bytes.toString('utf8'));
+        const imagesBefore = countImageBlocks(before);
+        const bytesBefore = bytes.byteLength;
+        const next = await r.apply(before, headers);
         if (next) {
           bytes = Buffer.from(JSON.stringify(next));
           headers.set('content-length', String(bytes.byteLength));
+          // Per-request evidence for the event row: this request carried an injected recall.
+          // Numbers only, measured on this body, so parallel requests cannot mix them up.
+          tags = { ...tags, recall_applied: true, recall_images: Math.max(0, countImageBlocks(next) - imagesBefore),
+            recall_bytes: bytes.byteLength - bytesBefore };
+          // "recall <name>": which session, how much of it fit, and the sessions it had
+          // itself recalled. `turns_cut` / `pages_cut` above 0 mean the model did not get all of it.
+          if (next[RECALL_INFO]) tags.recall = next[RECALL_INFO];
         }
       } catch (err) {
         // Recall must never break a request: forward the original body.
         console.warn(`[pxlite] recall skipped: ${err.message}`);
+        tags = { ...tags, recall_error: true };
       }
     }
     // All GPT wires, including canonical /v1 and Codex, not only opencode.ai.
     // Runs after recall so snapshots keep full original tool results.
-    let gptHistory, gptPolicyRequest, gptPrefixContext;
+    let gptHistory, gptPolicyRequest, gptPrefixContext, prefixPending;
     if (gptWire && !c.compact) {
       try {
         const parsed = JSON.parse(bytes.toString('utf8'));
@@ -329,6 +347,9 @@ async function toWebRequest(req) {
           n: parsed.input.length, boundary: gptPolicyRequest.cacheGate.heldCutoff ?? 0,
           collapsed: 0, mode: 'history_cache_gate' });
         if (claudeToolCollapse) tags = { ...tags, tool_collapse: report };
+        // Only where a closed prefix exists: the client input as the history planner will see it.
+        if (gptPolicyRequest) prefixPending = prefixTrace.observe({ sid, model: parsed.model,
+          route: new URL(url).pathname, parsed, recallApplied: tags?.recall_applied === true });
         // Fixed input-item epochs for managed GPT sessions. Read/write accounting
         // is not a clock: in particular, cache_write=0 does not mean cache is dead.
         if (sid && supportedGpt) {
@@ -362,6 +383,8 @@ async function toWebRequest(req) {
     request.pxliteGptHistory = gptHistory;
     request.pxliteGptPolicy = gptPolicyRequest;
     request.pxliteGptPrefixContext = gptPrefixContext;
+    request.pxlitePrefixPending = prefixPending;
+    request.pxliteAgentId = headers.get('x-claude-code-agent-id') ?? undefined;
     if ((responses || openCodeResponses) && DEBUG_SHAPE) debugShape('in', req.url, plain ?? raw, headers);
     return request;
   }
@@ -440,6 +463,22 @@ function claudeRequestTags(body, headers) {
   return tags;
 }
 
+// Image blocks of a Messages or Responses body, one level into tool_result content.
+function countImageBlocks(body) {
+  let n = 0;
+  const walk = (content) => {
+    if (!Array.isArray(content)) return;
+    for (const b of content) {
+      if (!b || typeof b !== 'object') continue;
+      if (b.type === 'image' || b.type === 'input_image' || b.type === 'image_url') n++;
+      else if (Array.isArray(b.content)) walk(b.content);
+    }
+  };
+  const items = Array.isArray(body?.messages) ? body.messages : Array.isArray(body?.input) ? body.input : [];
+  for (const m of items) walk(m?.content);
+  return n;
+}
+
 function slimEvent(ev) {
   for (const k of Object.keys(ev)) if (k.startsWith('req_body_') && k !== 'req_body_sha8') delete ev[k];
   if (typeof ev.error_body === 'string' && ev.error_body.length > 400) ev.error_body = ev.error_body.slice(0, 400) + '…';
@@ -483,6 +522,9 @@ async function serve() {
 
   fs.mkdirSync(STATE_DIR, { recursive: true });
   sessions.configureSessionStateStore(fileStore(path.join(STATE_DIR, 'session-state.json')));
+  const historyCore = await core('history.js');
+  const restoredCuts = historyCore.configureLastCutStore?.(fileStore(path.join(STATE_DIR, 'last-cuts.json'))) ?? 0;
+  if (restoredCuts > 0) console.log(`[pxlite] restored ${restoredCuts} history cut point(s)`);
   const log = new RotatingLog(process.env.PXPIPE_LOG ?? path.join(STATE_DIR, 'events.jsonl'), {
     // 50 MB live + one 50 MB backup = at most 100 MB on disk.
     maxBytes: Number(process.env.PXLITE_LOG_MAX_BYTES ?? 50 * 1024 * 1024),
@@ -580,11 +622,25 @@ async function serve() {
     return reason !== null;
   };
 
+  // One file per conversation: session, subagent (Claude Code subagents share the session id)
+  // and first user message (a compaction starts a new conversation under the same session).
+  const transcriptHook = historyTranscript && (({ messages, from, to, conversation }) => {
+    const store = requestCtx.getStore();
+    const sid = store?.tags?.session_id;
+    if (!sid) return null;
+    const r = historyTranscript.note({ key: [sid, store.agentId, conversation].filter(Boolean).join('-'), messages, from, to });
+    if (r.state !== 'none') store.tags = { ...store.tags, history_transcript: r.state };
+    return r.note;
+  });
+
   const proxyConfig = {
     transform: () => {
       if (disabled) return { compress: false };
       if (requestCtx.getStore()?.compact && !COMPACT_IMAGES) return { compress: false };
-      return { keepSharp, gptHistory: requestCtx.getStore()?.gptHistory };
+      const store = requestCtx.getStore();
+      const sid = store?.tags?.session_id;
+      return { keepSharp, gptHistory: store?.gptHistory, historyTranscript: transcriptHook,
+        conversationKey: sid ? [sid, store.agentId].filter(Boolean).join('-') : undefined };
     },
     onRequest: (e) => {
       stats.requests += 1;
@@ -595,6 +651,7 @@ async function serve() {
       try {
         const row = { ...toTrackEvent(e), ...requestCtx.getStore()?.tags };
         requestCtx.getStore()?.gptPolicy?.record(row);
+        prefixTrace.finish(requestCtx.getStore()?.prefixPending, row);
         log.write(projectGptEvent(slimEvent(row), { detail: process.env.PXLITE_LOG_DETAIL }));
       } catch (err) {
         console.warn(`[pxlite] event log write failed: ${err.message}`);
@@ -714,7 +771,8 @@ async function serve() {
         const handler = pickHandler(req.url);
         await writeWebResponse(await requestCtx.run({ compact, tags: webReq.pxliteTags,
           gptHistory: webReq.pxliteGptHistory, gptPolicy: webReq.pxliteGptPolicy,
-          gptPrefixContext: webReq.pxliteGptPrefixContext }, () => handler(webReq)), res);
+          gptPrefixContext: webReq.pxliteGptPrefixContext,
+          prefixPending: webReq.pxlitePrefixPending, agentId: webReq.pxliteAgentId }, () => handler(webReq)), res);
       })
       .catch((err) => {
         console.error('[pxlite] handler error:', err);
@@ -733,6 +791,7 @@ async function serve() {
 
   const shutdown = () => {
     sessions.flushSessionState();
+    historyCore.flushLastCuts?.();
     if (readPid() === process.pid) fs.rmSync(PID_FILE, { force: true });
     connectServer.close();
     server.close(() => process.exit(0));

@@ -65,10 +65,23 @@ export function toTrackEvent(ev) {
         // of an image_bytes skip (client images vs. our own pages) in later audits.
         if ((info.nativeImageBytes ?? 0) > 0)
             out.native_image_bytes = info.nativeImageBytes;
+        if (info.bigBlock)
+            out.big_block = info.bigBlock;
         if ((info.historyByteTrims ?? 0) > 0)
             out.history_byte_trims = info.historyByteTrims;
         if ((info.imageBudgetSkips ?? 0) > 0)
             out.image_budget_skips = info.imageBudgetSkips;
+        // PXLITE: a system prompt the client relocated into the opening user message
+        // (opencode-claude-auth). `relocated_system_*` says it was detected on this
+        // request; `standing_blocks_kept` says how many of those blocks a history
+        // collapse carried through verbatim. On a collapsed request the two block
+        // counts must match: fewer kept means instructions were demoted to a preview.
+        if ((info.relocatedSystemBlocks ?? 0) > 0) {
+            out.relocated_system_blocks = info.relocatedSystemBlocks;
+            out.relocated_system_chars = info.relocatedSystemChars;
+        }
+        if ((info.standingBlocksKept ?? 0) > 0)
+            out.standing_blocks_kept = info.standingBlocksKept;
         // Emit only when it disagrees with the render counter: equality is the common
         // case and a per-event key for "nothing to see" is noise.
         if (info.wireImages !== undefined
@@ -124,6 +137,20 @@ export function toTrackEvent(ev) {
         }
         if (info.collapsedImages !== undefined && info.collapsedImages > 0) {
             out.collapsed_images = info.collapsedImages;
+        }
+        if (info.collapsedImagePixels !== undefined && info.collapsedImagePixels > 0) {
+            out.collapsed_image_pixels = info.collapsedImagePixels;
+        }
+        if (info.historyCut) {
+            const c = info.historyCut;
+            out.history_cut = {
+                ...(c.tailHeld ? { tail_held: true } : {}),
+                ...(c.stickyCut ? { sticky: true } : {}),
+                ...(c.stickyRefused ? { sticky_refused: c.stickyRefused } : {}),
+                ...(c.firstCutExtended > 0 ? { first_cut_extended: c.firstCutExtended } : {}),
+                ...(c.tailTokens !== undefined ? { tail_tokens: c.tailTokens } : {}),
+                ...(c.cutMove ? { move: c.cutMove } : {}),
+            };
         }
         if (info.historyReason !== undefined) {
             out.history_reason = info.historyReason;

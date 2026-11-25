@@ -16,10 +16,13 @@ const line = (i, j) => `Turn ${i} line ${j}: the build log shows step ${i * 7 + 
 const text = (i, n) => Array.from({ length: n }, (_, j) => line(i, j)).join('\n');
 
 /** Claude-Code-shaped body: identity + static system block (marked), `turns` closed turns, marked final user turn. */
+let bodySeq = 0;
 function claudeBody(turns, { tailMarks = [] } = {}) {
   const messages = [];
+  // A distinct first user turn per body: the sticky cut is keyed by it and must not leak between tests.
+  const session = `Session ${bodySeq++}\n`;
   for (let i = 0; i < turns; i++) {
-    messages.push({ role: 'user', content: [{ type: 'text', text: text(i, 12) }] });
+    messages.push({ role: 'user', content: [{ type: 'text', text: (i === 0 ? session : '') + text(i, 12) }] });
     messages.push({ role: 'assistant', content: [{ type: 'text', text: text(i + 1000, 12) }] });
   }
   for (const k of tailMarks) messages[messages.length + k].content[0].cache_control = { ...H1 };
@@ -74,7 +77,8 @@ test('AC4(a) compressed body: last history image carries a marker, total <= 4, f
 });
 
 test('AC4(a) compressed body with a frozen carry-over chunk: both the carry-over and the last image are marked', async () => {
-  const { req, info } = await transform(claudeBody(60));
+  // 400 turns = 800 messages: past one 320-message freeze chunk, so a completed chunk exists to carry the marker.
+  const { req, info } = await transform(claudeBody(400));
   assert.equal(info.historyReason, 'collapsed');
   const { mi, ids } = historyImages(req);
   const marked = ids.filter((bi) => req.messages[mi].content[bi].cache_control);
